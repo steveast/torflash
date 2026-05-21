@@ -2,9 +2,10 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "steveast/torflash"
 
+import json
 import os
 import re
 import shutil
@@ -17,12 +18,29 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+
+LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
+TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"
+RESUME_DIR = LIBRARY_DIR / "resume"
+LIBRARY_FILE = LIBRARY_DIR / "library.json"
+STORAGE_DEFAULT = Path.home() / "Storage"
+AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "TorFlash.desktop"
+
+EXTRA_TRACKERS = [
+    "https://tracker.opentrackr.org:443/announce",
+    "https://tracker.gbitt.info:443/announce",
+    "https://tracker1.520.jp:443/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "http://retracker.local/announce",
+]
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QGuiApplication, QIcon
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -155,151 +173,285 @@ def detect_flash_mount() -> str | None:
     return None
 
 
+class SeedSession:
+    """Постоянная libtorrent-сессия. Хранит библиотеку, переустанавливает торренты на старте."""
+
+    def __init__(self):
+        import libtorrent as lt
+        self.lt = lt
+        LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+        TORRENTS_CACHE_DIR.mkdir(exist_ok=True)
+        RESUME_DIR.mkdir(exist_ok=True)
+        STORAGE_DEFAULT.mkdir(parents=True, exist_ok=True)
+        self.ses = lt.session({
+            "listen_interfaces": "0.0.0.0:6881",
+            "alert_mask": (
+                lt.alert.category_t.error_notification
+                | lt.alert.category_t.status_notification
+                | lt.alert.category_t.storage_notification
+            ),
+            "enable_dht": True,
+            "enable_lsd": False,
+            "enable_upnp": False,
+            "enable_natpmp": False,
+            "announce_to_all_trackers": True,
+            "announce_to_all_tiers": True,
+            "enable_outgoing_utp": True,
+            "enable_incoming_utp": True,
+            "dht_bootstrap_nodes": (
+                "router.bittorrent.com:6881,"
+                "router.utorrent.com:6881,"
+                "dht.transmissionbt.com:6881"
+            ),
+        })
+        print(f"[seed] listening on {self.ses.listen_port()}", flush=True)
+        self.handles: dict = {}
+        self.library: dict = self._load_library()
+        self._restore_torrents()
+
+    def _load_library(self) -> dict:
+        if LIBRARY_FILE.exists():
+            try:
+                return json.loads(LIBRARY_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def _save_library(self):
+        try:
+            LIBRARY_FILE.write_text(
+                json.dumps(self.library, ensure_ascii=False, indent=2)
+            )
+        except OSError as e:
+            print(f"[seed] failed to save library: {e}", flush=True)
+
+    def _hash_str(self, handle) -> str:
+        try:
+            ih = handle.info_hashes()
+            v1 = str(ih.v1)
+            return v1 if v1 != "0" * 40 else str(ih.v2)
+        except AttributeError:
+            return str(handle.info_hash())
+
+    def _restore_torrents(self):
+        for hid, meta in list(self.library.items()):
+            tfile = TORRENTS_CACHE_DIR / f"{hid}.torrent"
+            try:
+                params = self.lt.add_torrent_params()
+                if tfile.exists():
+                    params.ti = self.lt.torrent_info(
+                        self.lt.bdecode(tfile.read_bytes())
+                    )
+                else:
+                    params = self.lt.parse_magnet_uri(meta.get("magnet", ""))
+                params.save_path = meta.get("save_path", str(STORAGE_DEFAULT))
+                rfile = RESUME_DIR / f"{hid}.dat"
+                if rfile.exists():
+                    params.resume_data = rfile.read_bytes()
+                params.trackers = list({*(params.trackers or []), *EXTRA_TRACKERS})
+                handle = self.ses.add_torrent(params)
+                self.handles[hid] = handle
+                print(
+                    f"[seed] restored {meta.get('title','?')[:60]} ({hid[:8]})",
+                    flush=True,
+                )
+            except (RuntimeError, OSError, ValueError) as e:
+                print(f"[seed] restore failed for {hid}: {e}", flush=True)
+
+    def add(self, magnet: str, torrent_url: str, save_path: str):
+        params = None
+        torrent_bytes = None
+        if torrent_url:
+            try:
+                r = requests.get(
+                    torrent_url, headers=HEADERS, timeout=20, allow_redirects=True
+                )
+                r.raise_for_status()
+                torrent_bytes = r.content
+                ti = self.lt.torrent_info(self.lt.bdecode(torrent_bytes))
+                params = self.lt.add_torrent_params()
+                params.ti = ti
+            except (requests.RequestException, RuntimeError) as e:
+                print(f"[seed] .torrent fetch failed: {e}, fallback to magnet", flush=True)
+                params = None
+        if params is None:
+            params = self.lt.parse_magnet_uri(magnet)
+        params.save_path = save_path
+        params.trackers = list({*(params.trackers or []), *EXTRA_TRACKERS})
+        handle = self.ses.add_torrent(params)
+        handle.force_dht_announce()
+        info_hash = self._hash_str(handle)
+        self.handles[info_hash] = handle
+        if info_hash not in self.library:
+            self.library[info_hash] = {
+                "hash": info_hash,
+                "title": params.ti.name() if params.ti else "(получение метаданных…)",
+                "size": params.ti.total_size() if params.ti else 0,
+                "magnet": magnet,
+                "torrent_url": torrent_url,
+                "save_path": save_path,
+                "added_at": time.time(),
+                "completed_at": None,
+            }
+            if torrent_bytes:
+                try:
+                    (TORRENTS_CACHE_DIR / f"{info_hash}.torrent").write_bytes(torrent_bytes)
+                except OSError:
+                    pass
+            self._save_library()
+        return info_hash
+
+    def update_metadata(self, info_hash: str):
+        h = self.handles.get(info_hash)
+        if not h or not h.status().has_metadata:
+            return
+        info = h.torrent_file()
+        if info_hash in self.library:
+            self.library[info_hash]["title"] = info.name()
+            self.library[info_hash]["size"] = info.total_size()
+            tfile = TORRENTS_CACHE_DIR / f"{info_hash}.torrent"
+            if not tfile.exists():
+                try:
+                    ct = self.lt.create_torrent(info)
+                    tfile.write_bytes(self.lt.bencode(ct.generate()))
+                except Exception as e:
+                    print(f"[seed] dump .torrent failed: {e}", flush=True)
+            self._save_library()
+
+    def remove(self, info_hash: str, delete_files: bool = False):
+        h = self.handles.pop(info_hash, None)
+        if h:
+            try:
+                self.ses.remove_torrent(h, 1 if delete_files else 0)
+            except RuntimeError:
+                pass
+        meta = self.library.pop(info_hash, None)
+        if delete_files and meta:
+            # libtorrent's option=1 удалит payload. На всякий — подчистим пустую папку.
+            save_path = Path(meta.get("save_path", STORAGE_DEFAULT))
+            tfile = TORRENTS_CACHE_DIR / f"{info_hash}.torrent"
+            if tfile.exists():
+                try:
+                    ti = self.lt.torrent_info(self.lt.bdecode(tfile.read_bytes()))
+                    name = ti.name()
+                    target = save_path / name
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        (TORRENTS_CACHE_DIR / f"{info_hash}.torrent").unlink(missing_ok=True)
+        (RESUME_DIR / f"{info_hash}.dat").unlink(missing_ok=True)
+        self._save_library()
+
+    def get_status(self, info_hash: str):
+        h = self.handles.get(info_hash)
+        if not h:
+            return None
+        s = h.status()
+        meta = self.library.get(info_hash, {})
+        return {
+            "hash": info_hash,
+            "title": meta.get("title", "?"),
+            "size": meta.get("size", 0),
+            "progress": s.progress,
+            "state_id": s.state,
+            "state": DL_STATES[s.state] if 0 <= s.state < len(DL_STATES) else str(s.state),
+            "download_rate": s.download_rate,
+            "upload_rate": s.upload_rate,
+            "num_peers": s.num_peers,
+            "num_seeds": s.num_seeds,
+            "is_seeding": s.is_seeding,
+            "has_metadata": s.has_metadata,
+            "save_path": meta.get("save_path", str(STORAGE_DEFAULT)),
+        }
+
+    def all_statuses(self) -> list:
+        return [s for s in (self.get_status(h) for h in list(self.handles)) if s]
+
+    def drain_alerts(self):
+        for a in self.ses.pop_alerts():
+            if isinstance(a, self.lt.save_resume_data_alert):
+                try:
+                    hid = self._hash_str(a.handle)
+                    buf = self.lt.write_resume_data_buf(a.params)
+                    (RESUME_DIR / f"{hid}.dat").write_bytes(buf)
+                except Exception as e:
+                    print(f"[seed] write resume failed: {e}", flush=True)
+            else:
+                msg = a.message()
+                low = msg.lower()
+                if "error" in low or "fail" in low:
+                    print(f"[seed][alert] {type(a).__name__}: {msg}", flush=True)
+
+    def request_save_resume_all(self):
+        for h in list(self.handles.values()):
+            if h.is_valid() and h.status().has_metadata:
+                h.save_resume_data()
+
+    def shutdown(self):
+        self.request_save_resume_all()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            self.drain_alerts()
+            time.sleep(0.2)
+
+
 class DownloadWorker(QThread):
-    progress = pyqtSignal(int, str)  # percent, status_line
-    done = pyqtSignal(str, list)     # save_dir, list of relative file paths
+    progress = pyqtSignal(int, str)
+    done = pyqtSignal(str, list, str)   # save_dir, rel_paths, info_hash (остаётся в seed)
     failed = pyqtSignal(str)
 
-    def __init__(self, magnet: str, save_dir: str, torrent_url: str = ""):
+    def __init__(self, seed: SeedSession, magnet: str, save_dir: str, torrent_url: str = ""):
         super().__init__()
+        self.seed = seed
         self.magnet = magnet
         self.torrent_url = torrent_url
         self.save_dir = save_dir
         self._cancel = False
+        self.info_hash = ""
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
         try:
-            import libtorrent as lt
-        except ImportError as e:
-            self.failed.emit(f"libtorrent недоступен: {e}")
-            return
+            print(f"[DL] start save_dir={self.save_dir}", flush=True)
+            self.info_hash = self.seed.add(self.magnet, self.torrent_url, self.save_dir)
+            handle = self.seed.handles[self.info_hash]
+            print(f"[DL] hash={self.info_hash[:8]}", flush=True)
 
-        try:
-            print(f"[DL] start magnet={self.magnet[:80]}…", flush=True)
-            print(f"[DL] save_dir={self.save_dir}", flush=True)
-            # UDP в split-routing часто блокируется → DHT не работает.
-            # Используем только TCP-трекеры и единственный сетевой интерфейс,
-            # чтобы libtorrent не пытался announce-ить с каждого veth/docker.
-            ses = lt.session({
-                "listen_interfaces": "0.0.0.0:6881",
-                "alert_mask": (
-                    lt.alert.category_t.error_notification
-                    | lt.alert.category_t.status_notification
-                ),
-                "enable_dht": True,
-                "enable_lsd": False,
-                "enable_upnp": False,
-                "enable_natpmp": False,
-                "announce_to_all_trackers": True,
-                "announce_to_all_tiers": True,
-                "enable_outgoing_utp": True,
-                "enable_incoming_utp": True,
-                "enable_outgoing_tcp": True,
-                "enable_incoming_tcp": True,
-                "dht_bootstrap_nodes": (
-                    "router.bittorrent.com:6881,"
-                    "router.utorrent.com:6881,"
-                    "dht.transmissionbt.com:6881"
-                ),
-            })
-            print(f"[DL] session listening on port {ses.listen_port()}", flush=True)
-            # Только HTTP/HTTPS-трекеры — UDP режется sing-box VPN.
-            extra_trackers = [
-                "https://tracker.opentrackr.org:443/announce",
-                "https://tracker.gbitt.info:443/announce",
-                "https://tracker1.520.jp:443/announce",
-                "http://tracker.openbittorrent.com:80/announce",
-                "http://retracker.local/announce",
-            ]
-            params = None
-            if self.torrent_url:
-                print(f"[DL] downloading .torrent from {self.torrent_url}", flush=True)
-                try:
-                    r = requests.get(self.torrent_url, headers=HEADERS, timeout=20, allow_redirects=True)
-                    r.raise_for_status()
-                    print(f"[DL] .torrent {len(r.content)} bytes", flush=True)
-                    info = lt.torrent_info(lt.bdecode(r.content))
-                    params = lt.add_torrent_params()
-                    params.ti = info
-                except (requests.RequestException, RuntimeError) as e:
-                    print(f"[DL] .torrent fetch failed: {e}; fallback to magnet", flush=True)
-                    params = None
-            if params is None:
-                params = lt.parse_magnet_uri(self.magnet)
-            params.save_path = self.save_dir
-            existing = list(params.trackers or [])
-            for t in extra_trackers:
-                if t not in existing:
-                    existing.append(t)
-            params.trackers = existing
-            handle = ses.add_torrent(params)
-            handle.force_dht_announce()
-            has_meta_already = params.ti is not None
-            print(
-                f"[DL] torrent added, trackers: {len(params.trackers)}, "
-                f"metadata-from-file: {has_meta_already}",
-                flush=True,
-            )
-
-            self.progress.emit(0, "Получение метаданных (DHT + трекеры)…")
-            meta_deadline = time.monotonic() + 180  # 3 минуты на метаданные
-            tick = 0
-            seen_alerts: set[str] = set()
+            self.progress.emit(0, "Получение метаданных…")
+            meta_deadline = time.monotonic() + 180
             while not handle.status().has_metadata:
                 if self._cancel:
-                    ses.remove_torrent(handle)
+                    self.seed.remove(self.info_hash, delete_files=True)
                     self.failed.emit("Отменено")
                     return
                 if time.monotonic() > meta_deadline:
                     s = handle.status()
-                    ses.remove_torrent(handle)
+                    self.seed.remove(self.info_hash, delete_files=True)
                     self.failed.emit(
-                        f"Не удалось получить метаданные за 3 мин "
-                        f"(DHT-нод: {getattr(s, 'dht_nodes', '?')}, "
-                        f"пиров: {s.num_peers}). "
-                        "Проверьте сеть/VPN или попробуйте другой торрент."
+                        f"Метаданные не получены за 3 мин (пиров: {s.num_peers})"
                     )
                     return
                 s = handle.status()
-                dht = getattr(s, "dht_nodes", None)
-                for a in ses.pop_alerts():
-                    msg = a.message()
-                    low = msg.lower()
-                    if "error" not in low and "fail" not in low:
-                        continue
-                    # Сворачиваем шум: уникализируем по типу + первой части без IP
-                    key = f"{type(a).__name__}:{msg.split('[')[0]}"
-                    if key in seen_alerts:
-                        continue
-                    seen_alerts.add(key)
-                    print(f"[DL][alert] {type(a).__name__}: {msg}", flush=True)
-                if tick % 5 == 0:
-                    print(
-                        f"[DL] meta wait t={tick}s peers={s.num_peers} dht_nodes={dht}",
-                        flush=True,
-                    )
-                self.progress.emit(
-                    0,
-                    f"Получение метаданных… пиров: {s.num_peers}"
-                    + (f" · DHT-нод: {dht}" if dht else ""),
-                )
+                self.progress.emit(0, f"Получение метаданных… пиров: {s.num_peers}")
                 time.sleep(1)
-                tick += 1
-            print(f"[DL] metadata received after {tick}s", flush=True)
+            self.seed.update_metadata(self.info_hash)
 
             info = handle.torrent_file()
             total = info.total_size()
-            file_storage = info.files()
-            rel_paths = [file_storage.file_path(i) for i in range(file_storage.num_files())]
+            files = info.files()
+            rel_paths = [files.file_path(i) for i in range(files.num_files())]
 
-            dl_tick = 0
             dl_start = time.monotonic()
+            tick = 0
             while True:
                 if self._cancel:
-                    ses.remove_torrent(handle)
+                    self.seed.remove(self.info_hash, delete_files=True)
                     self.failed.emit("Отменено")
                     return
                 s = handle.status()
@@ -316,22 +468,20 @@ class DownloadWorker(QThread):
                     f"· ETA {fmt_time(eta_s)} · прошло {fmt_time(elapsed)}"
                 )
                 self.progress.emit(pct, line)
-                if dl_tick % 5 == 0:
+                if tick % 5 == 0:
                     print(f"[DL] {line}", flush=True)
-                for a in ses.pop_alerts():
-                    msg = a.message()
-                    if "error" in msg.lower() or "fail" in msg.lower():
-                        print(f"[DL][alert] {type(a).__name__}: {msg}", flush=True)
                 if s.is_seeding or s.progress >= 1.0:
                     break
                 time.sleep(1)
-                dl_tick += 1
+                tick += 1
 
-            print(f"[DL] complete, removing torrent", flush=True)
-            ses.remove_torrent(handle)
-            self.done.emit(self.save_dir, rel_paths)
-        except Exception as e:  # libtorrent может бросать boost-ошибки
-            self.failed.emit(f"Ошибка libtorrent: {e}")
+            print("[DL] complete, kept in seed session", flush=True)
+            if self.info_hash in self.seed.library:
+                self.seed.library[self.info_hash]["completed_at"] = time.time()
+                self.seed._save_library()
+            self.done.emit(self.save_dir, rel_paths, self.info_hash)
+        except Exception as e:
+            self.failed.emit(f"Ошибка: {e}")
 
 
 class CopyWorker(QThread):
@@ -545,6 +695,70 @@ class SearchWorker(QThread):
 MAGNET_HASH_RE = re.compile(r"btih:([a-f0-9]+)", re.I)
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} — настройки")
+        self.settings = settings
+        v = QVBoxLayout(self)
+        v.setSpacing(10)
+
+        self.cb_minimize = QCheckBox("Сворачивать в трей при закрытии окна")
+        self.cb_minimize.setChecked(
+            settings.value("minimize_on_close", True, type=bool)
+        )
+        v.addWidget(self.cb_minimize)
+
+        self.cb_autostart = QCheckBox("Запускать при входе в систему")
+        self.cb_autostart.setChecked(AUTOSTART_FILE.exists())
+        v.addWidget(self.cb_autostart)
+
+        self.cb_hidden = QCheckBox("Скрытый старт (только иконка в трее)")
+        self.cb_hidden.setChecked(
+            settings.value("start_hidden", False, type=bool)
+        )
+        v.addWidget(self.cb_hidden)
+
+        info = QLabel(
+            "Скачивание всегда идёт в <b>~/Storage</b>. Файлы хранятся там до "
+            "ручного удаления из вкладки «Моя раздача»."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888; padding-top: 6px;")
+        v.addWidget(info)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._apply)
+        buttons.rejected.connect(self.reject)
+        v.addWidget(buttons)
+
+    def _apply(self):
+        self.settings.setValue("minimize_on_close", self.cb_minimize.isChecked())
+        self.settings.setValue("start_hidden", self.cb_hidden.isChecked())
+        self._apply_autostart(self.cb_autostart.isChecked())
+        self.accept()
+
+    def _apply_autostart(self, enabled: bool):
+        if enabled:
+            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            exe = sys.executable if getattr(sys, "frozen", False) else f"/usr/bin/python3 {Path(__file__).resolve()}"
+            icon = Path(__file__).resolve().parent / "torflash.svg"
+            content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                f"Exec={exe} --hidden\n"
+                f"Icon={icon}\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+                f"X-KDE-autostart-after=panel\n"
+            )
+            AUTOSTART_FILE.write_text(content)
+            AUTOSTART_FILE.chmod(0o755)
+        else:
+            AUTOSTART_FILE.unlink(missing_ok=True)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -570,20 +784,52 @@ class MainWindow(QMainWindow):
         else:
             self.dst_dir = str(Path.home() / "Storage")
             self._initial_use_flash = False
-        self._tmp_dir: str = ""
         self.settings = QSettings("TorFlash", "TorFlash")
+        self.seed = SeedSession()
         self._build_ui()
         self._apply_style()
         self._build_tray()
+        # Тикер для обновления вкладки «Моя раздача»
+        from PyQt5.QtCore import QTimer
+        self._lib_timer = QTimer(self)
+        self._lib_timer.setInterval(2000)
+        self._lib_timer.timeout.connect(self._refresh_library)
+        self._lib_timer.start()
+        # Тикер для drain_alerts/resume save
+        self._alerts_timer = QTimer(self)
+        self._alerts_timer.setInterval(1500)
+        self._alerts_timer.timeout.connect(self.seed.drain_alerts)
+        self._alerts_timer.start()
+        # Периодически просим libtorrent сохранить resume_data
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setInterval(60_000)
+        self._resume_timer.timeout.connect(self.seed.request_save_resume_all)
+        self._resume_timer.start()
+        self._refresh_library()
 
     # ---------- UI building ----------
 
     def _build_ui(self):
+        from PyQt5.QtWidgets import QTabWidget
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(10, 10, 10, 6)
         root.setSpacing(8)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_search_tab(), "Поиск")
+        tabs.addTab(self._build_library_tab(), "Моя раздача")
+        root.addWidget(tabs, 1)
+        self.tabs = tabs
+
+        self.setStatusBar(QStatusBar())
+
+    def _build_search_tab(self) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(8)
 
         # Поисковая строка
         search_row = QHBoxLayout()
@@ -596,20 +842,21 @@ class MainWindow(QMainWindow):
         self.search_btn.setDefault(True)
         self.search_btn.clicked.connect(self.start_search)
         search_row.addWidget(self.search_btn)
-        root.addLayout(search_row)
+        v.addLayout(search_row)
 
-        # Папка назначения
+        # Папка назначения (только если включена флешка) + опции
         dst_row = QHBoxLayout()
-        self.flash_check = QCheckBox("На флешку (Movies)")
+        self.flash_check = QCheckBox("Дублировать на флешку (Movies)")
         self.flash_check.setChecked(self._initial_use_flash)
         self.flash_check.setToolTip(
-            "Включено: копировать на флешку в /Movies. "
-            "Выключено: сохранять в ~/Storage."
+            "Загрузка всегда идёт в ~/Storage. "
+            "При включении дополнительно копируем на флешку в /Movies с разбиением для FAT32."
         )
         self.flash_check.toggled.connect(self._on_flash_toggle)
         dst_row.addWidget(self.flash_check)
         self.dst_edit = QLineEdit(self.dst_dir)
         self.dst_edit.setReadOnly(True)
+        self.dst_edit.setToolTip("Папка, куда дополнительно копируем (флешка)")
         dst_row.addWidget(self.dst_edit, 1)
         self.dst_btn = QToolButton()
         self.dst_btn.setText("…")
@@ -626,7 +873,7 @@ class MainWindow(QMainWindow):
         self.eject_btn.setToolTip("Безопасно извлечь флешку")
         self.eject_btn.clicked.connect(self.eject_flash)
         dst_row.addWidget(self.eject_btn)
-        root.addLayout(dst_row)
+        v.addLayout(dst_row)
 
         # Сплиттер: список ← → детали
         splitter = QSplitter(Qt.Horizontal)
@@ -635,9 +882,40 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([720, 520])
-        root.addWidget(splitter, 1)
+        v.addWidget(splitter, 1)
+        return wrap
 
-        self.setStatusBar(QStatusBar())
+    def _build_library_tab(self) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 8, 0, 0)
+        v.setSpacing(8)
+        info = QLabel(
+            f"Все скачанные торренты лежат в <b>{STORAGE_DEFAULT}</b> и раздаются, "
+            "пока приложение открыто. Файлы не удаляются автоматически."
+        )
+        info.setStyleSheet("color: #888;")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        self.lib_table = QTableWidget(0, 6)
+        self.lib_table.setHorizontalHeaderLabels(
+            ["Название", "Размер", "Прогресс", "↓", "↑", "Пиров"]
+        )
+        self.lib_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.lib_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.lib_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.lib_table.setAlternatingRowColors(True)
+        self.lib_table.verticalHeader().setVisible(False)
+        lh = self.lib_table.horizontalHeader()
+        lh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 6):
+            lh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        self.lib_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lib_table.customContextMenuRequested.connect(self._lib_context_menu)
+        v.addWidget(self.lib_table, 1)
+
+        return wrap
 
     def _build_list(self) -> QWidget:
         self.table = QTableWidget(0, 5)
@@ -798,13 +1076,9 @@ class MainWindow(QMainWindow):
         self.act_show.triggered.connect(self._tray_show)
         menu.addAction(self.act_show)
         menu.addSeparator()
-        self.act_minimize = QAction("Сворачивать при закрытии", self, checkable=True)
-        self.act_minimize.setChecked(
-            self.settings.value("minimize_on_close", True, type=bool)
-        )
-        self.act_minimize.toggled.connect(self._on_minimize_toggle)
-        menu.addAction(self.act_minimize)
-        menu.addSeparator()
+        act_settings = QAction("Настройки…", self)
+        act_settings.triggered.connect(self.open_settings)
+        menu.addAction(act_settings)
         self.act_update = QAction(f"Проверить обновление… (v{APP_VERSION})", self)
         self.act_update.triggered.connect(self.check_for_updates)
         menu.addAction(self.act_update)
@@ -829,8 +1103,9 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def _on_minimize_toggle(self, checked: bool):
-        self.settings.setValue("minimize_on_close", checked)
+    def open_settings(self):
+        dlg = SettingsDialog(self.settings, self)
+        dlg.exec_()
 
     def _tray_quit(self):
         if self.tray:
@@ -1112,16 +1387,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Уже идёт другая загрузка", 3000)
             return
         try:
-            Path(self.dst_dir).mkdir(parents=True, exist_ok=True)
+            STORAGE_DEFAULT.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self._show_banner(f"Не удалось создать {self.dst_dir}: {e}")
+            self._show_banner(f"Не удалось создать {STORAGE_DEFAULT}: {e}")
             return
-        if not os.access(self.dst_dir, os.W_OK):
-            self._show_banner(f"Нет прав на запись в {self.dst_dir}")
-            return
-
+        # Если флешка — проверяем доступ дополнительно при копировании.
         self._hide_banner()
-        self._tmp_dir = tempfile.mkdtemp(prefix="rutor-")
         self.dl_result = r
         self.dl_phase = "dl"
         self.dl_progress = (0, "Запуск…")
@@ -1129,7 +1400,9 @@ class MainWindow(QMainWindow):
         self.progress_box.setVisible(True)
         self.flash_btn.setEnabled(False)
 
-        self.dl_worker = DownloadWorker(r["magnet"], self._tmp_dir, r.get("torrent_url", ""))
+        self.dl_worker = DownloadWorker(
+            self.seed, r["magnet"], str(STORAGE_DEFAULT), r.get("torrent_url", "")
+        )
         self.dl_worker.progress.connect(self._on_dl_progress)
         self.dl_worker.done.connect(self._on_dl_done)
         self.dl_worker.failed.connect(self._on_dl_failed)
@@ -1149,14 +1422,36 @@ class MainWindow(QMainWindow):
             self._refresh_progress_widget()
 
     def _on_dl_failed(self, err: str):
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
         self._reset_dl_state()
         if err == "Отменено":
             self.statusBar().showMessage("Загрузка отменена", 3000)
             return
         self._show_banner(f"Ошибка загрузки: {err}")
 
-    def _on_dl_done(self, save_dir: str, rel_paths: list):
+    def _on_dl_done(self, save_dir: str, rel_paths: list, info_hash: str):
+        # Файлы лежат в ~/Storage и торрент остаётся в seed session.
+        # Если включена флешка — копируем туда дополнительно.
+        if not self.flash_check.isChecked():
+            self._reset_dl_state()
+            self.statusBar().showMessage(
+                f"Скачано в {save_dir}, продолжаю раздачу", 8000
+            )
+            self._show_banner(
+                f"Готово: файлы в {save_dir}, раздаются. Управление — на вкладке «Моя раздача».",
+                kind="info",
+            )
+            return
+        # Копирование на флешку
+        try:
+            Path(self.dst_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._reset_dl_state()
+            self._show_banner(f"Не удалось создать {self.dst_dir}: {e}")
+            return
+        if not os.access(self.dst_dir, os.W_OK):
+            self._reset_dl_state()
+            self._show_banner(f"Нет прав на запись в {self.dst_dir}")
+            return
         self.dl_phase = "copy"
         self.dl_progress = (0, "Подготовка…")
         cur = self.current_result()
@@ -1175,22 +1470,22 @@ class MainWindow(QMainWindow):
             self._refresh_progress_widget()
 
     def _on_copy_done(self, report: list):
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
         summary = " · ".join(line for line in report)
         self._reset_dl_state()
         self.statusBar().showMessage(f"Готово: {summary}", 8000)
         self._show_banner(
-            "Готово! " + "; ".join(line.lstrip("✓✂ ").strip() for line in report),
+            "Скопировано на флешку. Оригинал в ~/Storage, раздаётся.",
             kind="info",
         )
 
     def _on_copy_failed(self, err: str):
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
         self._reset_dl_state()
         if err == "Отменено":
             self.statusBar().showMessage("Копирование отменено", 3000)
             return
-        self._show_banner(f"Ошибка копирования: {err}")
+        self._show_banner(
+            f"Ошибка копирования: {err}. Файлы скачаны в ~/Storage, раздача идёт."
+        )
 
     def _reset_dl_state(self):
         self.dl_result = None
@@ -1200,6 +1495,76 @@ class MainWindow(QMainWindow):
         self.dl_progress = (0, "")
         self.progress_box.setVisible(False)
         self.flash_btn.setEnabled(True)
+
+    # ---------- library / seeding ----------
+
+    def _refresh_library(self):
+        rows = self.seed.all_statuses()
+        # Сортируем: незавершённые сверху, потом по убыванию upload_rate
+        rows.sort(key=lambda r: (r["progress"] >= 1.0, -r["upload_rate"]))
+        self.lib_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self._set_lib_row(i, r)
+
+    def _set_lib_row(self, i: int, r: dict):
+        title_item = QTableWidgetItem(r["title"] or "(метаданные…)")
+        title_item.setData(Qt.UserRole, r["hash"])
+        size_item = QTableWidgetItem(human_bytes(r["size"]) if r["size"] else "?")
+        pct = int(r["progress"] * 100)
+        if r["is_seeding"] or pct == 100:
+            prog_text = f"🟢 раздача"
+        elif r["has_metadata"]:
+            prog_text = f"{r['state']} {pct}%"
+        else:
+            prog_text = "метаданные…"
+        prog_item = QTableWidgetItem(prog_text)
+        prog_item.setTextAlignment(Qt.AlignCenter)
+        down_item = QTableWidgetItem(f"{human_bytes(r['download_rate'])}/s")
+        up_item = QTableWidgetItem(f"{human_bytes(r['upload_rate'])}/s")
+        if r["upload_rate"] > 0:
+            up_item.setForeground(Qt.green)
+        peers_item = QTableWidgetItem(f"{r['num_peers']} ({r['num_seeds']}↑)")
+        peers_item.setTextAlignment(Qt.AlignCenter)
+        for col, item in enumerate(
+            (title_item, size_item, prog_item, down_item, up_item, peers_item)
+        ):
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.lib_table.setItem(i, col, item)
+
+    def _lib_context_menu(self, pos):
+        item = self.lib_table.itemAt(pos)
+        if not item:
+            return
+        row = item.row()
+        title_item = self.lib_table.item(row, 0)
+        info_hash = title_item.data(Qt.UserRole) if title_item else None
+        if not info_hash:
+            return
+        menu = QMenu(self)
+        act_open = menu.addAction("Открыть папку")
+        act_open.triggered.connect(lambda: self._lib_open_folder(info_hash))
+        menu.addSeparator()
+        act_rm = menu.addAction("Убрать из раздачи (файлы оставить)")
+        act_rm.triggered.connect(lambda: self._lib_remove(info_hash, False))
+        act_del = menu.addAction("Удалить вместе с файлами")
+        act_del.triggered.connect(lambda: self._lib_remove(info_hash, True))
+        menu.exec_(self.lib_table.viewport().mapToGlobal(pos))
+
+    def _lib_open_folder(self, info_hash: str):
+        meta = self.seed.library.get(info_hash)
+        if not meta:
+            return
+        save = Path(meta.get("save_path", STORAGE_DEFAULT))
+        try:
+            subprocess.Popen(["xdg-open", str(save)])
+        except OSError as e:
+            self._show_banner(f"Не открыть {save}: {e}")
+
+    def _lib_remove(self, info_hash: str, delete_files: bool):
+        self.seed.remove(info_hash, delete_files=delete_files)
+        self._refresh_library()
+        msg = "Удалено вместе с файлами" if delete_files else "Убрано из раздачи"
+        self.statusBar().showMessage(msg, 3000)
 
     # ---------- updater ----------
 
@@ -1296,12 +1661,31 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
-    icon_path = Path(__file__).parent / "torflash.svg"
+    app.setQuitOnLastWindowClosed(False)  # окно скрывается в трей — не выходим
+    icon_path = Path(__file__).resolve().parent / "torflash.svg"
+    if not icon_path.exists():
+        mei = getattr(sys, "_MEIPASS", None)
+        if mei:
+            icon_path = Path(mei) / "torflash.svg"
     if icon_path.exists():
         from PyQt5.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
-    w.show()
+
+    # Корректное закрытие seed-сессии и сохранение resume_data
+    def _on_about_to_quit():
+        try:
+            w.seed.shutdown()
+        except Exception as e:
+            print(f"[main] seed shutdown error: {e}", flush=True)
+    app.aboutToQuit.connect(_on_about_to_quit)
+
+    start_hidden = (
+        "--hidden" in sys.argv
+        or w.settings.value("start_hidden", False, type=bool)
+    )
+    if not start_hidden:
+        w.show()
     sys.exit(app.exec_())
 
 
