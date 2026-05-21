@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 GITHUB_REPO = "steveast/torflash"
 
 import json
@@ -146,6 +146,25 @@ def human_bytes(n: float) -> str:
     return f"{n:.1f} PiB"
 
 
+SIZE_RE = re.compile(r"([\d.,]+)\s*(KB|MB|GB|TB|B)?", re.I)
+SIZE_FACTORS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def parse_size_text(s: str) -> int:
+    if not s:
+        return 0
+    s = s.replace("\xa0", " ").strip()
+    m = SIZE_RE.match(s)
+    if not m:
+        return 0
+    try:
+        val = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return 0
+    unit = (m.group(2) or "B").upper()
+    return int(val * SIZE_FACTORS.get(unit, 1))
+
+
 def fmt_time(seconds) -> str:
     if seconds is None:
         return "—"
@@ -235,19 +254,21 @@ class SeedSession:
 
     def _restore_torrents(self):
         for hid, meta in list(self.library.items()):
+            rfile = RESUME_DIR / f"{hid}.dat"
             tfile = TORRENTS_CACHE_DIR / f"{hid}.torrent"
             try:
-                params = self.lt.add_torrent_params()
-                if tfile.exists():
+                if rfile.exists():
+                    # read_resume_data возвращает add_torrent_params со всей нужной инфой
+                    params = self.lt.read_resume_data(rfile.read_bytes())
+                elif tfile.exists():
+                    params = self.lt.add_torrent_params()
                     params.ti = self.lt.torrent_info(
                         self.lt.bdecode(tfile.read_bytes())
                     )
+                    params.save_path = meta.get("save_path", str(STORAGE_DEFAULT))
                 else:
                     params = self.lt.parse_magnet_uri(meta.get("magnet", ""))
-                params.save_path = meta.get("save_path", str(STORAGE_DEFAULT))
-                rfile = RESUME_DIR / f"{hid}.dat"
-                if rfile.exists():
-                    params.resume_data = rfile.read_bytes()
+                    params.save_path = meta.get("save_path", str(STORAGE_DEFAULT))
                 params.trackers = list({*(params.trackers or []), *EXTRA_TRACKERS})
                 handle = self.ses.add_torrent(params)
                 self.handles[hid] = handle
@@ -255,7 +276,7 @@ class SeedSession:
                     f"[seed] restored {meta.get('title','?')[:60]} ({hid[:8]})",
                     flush=True,
                 )
-            except (RuntimeError, OSError, ValueError) as e:
+            except (RuntimeError, OSError, ValueError, TypeError) as e:
                 print(f"[seed] restore failed for {hid}: {e}", flush=True)
 
     def add(self, magnet: str, torrent_url: str, save_path: str):
@@ -404,12 +425,14 @@ class DownloadWorker(QThread):
     done = pyqtSignal(str, list, str)   # save_dir, rel_paths, info_hash (остаётся в seed)
     failed = pyqtSignal(str)
 
-    def __init__(self, seed: SeedSession, magnet: str, save_dir: str, torrent_url: str = ""):
+    def __init__(self, seed: SeedSession, magnet: str, save_dir: str,
+                 torrent_url: str = "", mark_pending_flash: bool = False):
         super().__init__()
         self.seed = seed
         self.magnet = magnet
         self.torrent_url = torrent_url
         self.save_dir = save_dir
+        self.mark_pending_flash = mark_pending_flash
         self._cancel = False
         self.info_hash = ""
 
@@ -421,7 +444,10 @@ class DownloadWorker(QThread):
             print(f"[DL] start save_dir={self.save_dir}", flush=True)
             self.info_hash = self.seed.add(self.magnet, self.torrent_url, self.save_dir)
             handle = self.seed.handles[self.info_hash]
-            print(f"[DL] hash={self.info_hash[:8]}", flush=True)
+            if self.mark_pending_flash and self.info_hash in self.seed.library:
+                self.seed.library[self.info_hash]["pending_flash_copy"] = True
+                self.seed._save_library()
+            print(f"[DL] hash={self.info_hash[:8]} pending_flash={self.mark_pending_flash}", flush=True)
 
             self.progress.emit(0, "Получение метаданных…")
             meta_deadline = time.monotonic() + 180
@@ -512,6 +538,7 @@ class CopyWorker(QThread):
             self._total = total_bytes
             copied = 0
             report = []
+            has_mkvmerge = shutil.which("mkvmerge") is not None
             for src in sources:
                 rel = src.relative_to(self.src_dir)
                 dst = Path(self.dst_dir) / rel
@@ -520,6 +547,12 @@ class CopyWorker(QThread):
                 if size <= self.chunk_size:
                     copied = self._stream_copy(src, dst, copied, total_bytes, f"копирую {rel.name}")
                     report.append(f"✓ {rel} ({human_bytes(size)})")
+                elif src.suffix.lower() == ".mkv" and has_mkvmerge:
+                    parts = self._mkvmerge_split(src, dst, copied, total_bytes)
+                    copied += size
+                    report.append(
+                        f"M {rel} → {parts} проигрываемых MKV-частей через mkvmerge"
+                    )
                 else:
                     parts = self._split_copy(src, dst, copied, total_bytes)
                     copied += size
@@ -554,14 +587,56 @@ class CopyWorker(QThread):
             f"· ETA {fmt_time(eta)} · прошло {fmt_time(elapsed)}"
         )
 
+    def _mkvmerge_split(self, src: Path, dst: Path, copied: int, total: int) -> int:
+        """Режет MKV по keyframe'ам через mkvmerge — каждая часть валидный MKV.
+
+        Имена частей: name-001.mkv, name-002.mkv, ..."""
+        chunk_mb = max(64, self.chunk_size // (1024 * 1024))
+        cmd = [
+            "mkvmerge",
+            "--gui-mode",
+            "-o", str(dst),
+            "--split", f"size:{chunk_mb}M",
+            str(src),
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        src_size = src.stat().st_size
+        for line in proc.stdout or []:
+            if self._cancel:
+                proc.terminate()
+                break
+            m = re.search(r"#GUI#progress\s+(\d+)%", line) or re.search(r"Progress:\s*(\d+)%", line)
+            if m:
+                local_pct = int(m.group(1))
+                global_done = copied + (local_pct / 100.0) * src_size
+                global_pct = int(global_done * 100 / total) if total else 0
+                self.progress.emit(
+                    global_pct,
+                    self._stat_line(int(global_done), f"mkvmerge {src.name} {local_pct}%"),
+                )
+        proc.wait()
+        if proc.returncode not in (0, 1):  # 1 = warnings, still produces output
+            raise OSError(f"mkvmerge exit {proc.returncode}")
+        # Подсчёт получившихся частей
+        produced = sorted(dst.parent.glob(f"{dst.stem}-*{dst.suffix}"))
+        return len(produced)
+
     def _split_copy(self, src: Path, dst: Path, copied: int, total: int) -> int:
         buf_size = 4 * 1024 * 1024
         part_idx = 0
+        # Расширение сохраняется в конце: name.part001.mkv (а не name.mkv.part001)
+        stem, ext = dst.stem, dst.suffix
         with open(src, "rb") as fin:
             while True:
                 if self._cancel:
                     return part_idx
-                part_name = f"{dst.name}.part{part_idx:03d}"
+                part_name = f"{stem}.part{part_idx:03d}{ext}"
                 part_path = dst.with_name(part_name)
                 written = 0
                 with open(part_path, "wb") as fout:
@@ -695,6 +770,17 @@ class SearchWorker(QThread):
 MAGNET_HASH_RE = re.compile(r"btih:([a-f0-9]+)", re.I)
 
 
+def themed_icon(name: str, style=None, fallback=None) -> QIcon:
+    """Сначала пробуем иконку из системной темы (Breeze, Adwaita, …),
+    затем — стандартную из Qt-стиля. Возвращаем пустую QIcon в крайнем случае."""
+    icon = QIcon.fromTheme(name)
+    if not icon.isNull() and icon.availableSizes():
+        return icon
+    if style is not None and fallback is not None:
+        return style.standardIcon(fallback)
+    return QIcon()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -805,6 +891,10 @@ class MainWindow(QMainWindow):
         self._resume_timer.setInterval(60_000)
         self._resume_timer.timeout.connect(self.seed.request_save_resume_all)
         self._resume_timer.start()
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(5000)
+        self._flash_timer.timeout.connect(self._refresh_flash_info)
+        self._flash_timer.start()
         self._refresh_library()
 
     # ---------- UI building ----------
@@ -898,6 +988,43 @@ class MainWindow(QMainWindow):
         info.setWordWrap(True)
         v.addWidget(info)
 
+        # Прогресс активного авто-копирования на флешку
+        self.lib_copy_box = QFrame()
+        self.lib_copy_box.setObjectName("progressBox")
+        self.lib_copy_box.setVisible(False)
+        cb = QVBoxLayout(self.lib_copy_box)
+        cb.setContentsMargins(12, 8, 12, 8)
+        cb.setSpacing(4)
+        self.lib_copy_phase = QLabel("")
+        self.lib_copy_phase.setStyleSheet("font-weight: 600;")
+        cb.addWidget(self.lib_copy_phase)
+        self.lib_copy_bar = QProgressBar()
+        self.lib_copy_bar.setMinimum(0)
+        self.lib_copy_bar.setMaximum(100)
+        self.lib_copy_bar.setProperty("phase", "copy")
+        cb.addWidget(self.lib_copy_bar)
+        bottom = QHBoxLayout()
+        self.lib_copy_status = QLabel("")
+        self.lib_copy_status.setStyleSheet("color: #888;")
+        self.lib_copy_status.setWordWrap(True)
+        bottom.addWidget(self.lib_copy_status, 1)
+        self.lib_copy_cancel = QPushButton("Отмена")
+        self.lib_copy_cancel.setIcon(themed_icon("process-stop", self.style(), QStyle.SP_DialogCancelButton))
+        self.lib_copy_cancel.clicked.connect(self._cancel_pending_copy)
+        bottom.addWidget(self.lib_copy_cancel)
+        cb.addLayout(bottom)
+        v.addWidget(self.lib_copy_box)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_library_list())
+        splitter.addWidget(self._build_library_detail())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([720, 520])
+        v.addWidget(splitter, 1)
+        return wrap
+
+    def _build_library_list(self) -> QWidget:
         self.lib_table = QTableWidget(0, 6)
         self.lib_table.setHorizontalHeaderLabels(
             ["Название", "Размер", "Прогресс", "↓", "↑", "Пиров"]
@@ -913,9 +1040,105 @@ class MainWindow(QMainWindow):
             lh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         self.lib_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lib_table.customContextMenuRequested.connect(self._lib_context_menu)
-        v.addWidget(self.lib_table, 1)
+        self.lib_table.itemSelectionChanged.connect(self._on_lib_selection_changed)
+        return self.lib_table
 
-        return wrap
+    def _build_library_detail(self) -> QWidget:
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(16, 8, 16, 16)
+        v.setSpacing(10)
+
+        self.lib_empty = QLabel("Выберите торрент в списке слева")
+        self.lib_empty.setObjectName("emptyHint")
+        self.lib_empty.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.lib_empty)
+
+        self.lib_detail_card = QWidget()
+        self.lib_detail_card.setVisible(False)
+        card = QVBoxLayout(self.lib_detail_card)
+        card.setContentsMargins(0, 0, 0, 0)
+        card.setSpacing(10)
+
+        self.lib_title = QLabel()
+        self.lib_title.setWordWrap(True)
+        f = QFont(); f.setPointSize(13); f.setBold(True)
+        self.lib_title.setFont(f)
+        card.addWidget(self.lib_title)
+
+        meta_box = QFrame()
+        meta_box.setObjectName("metaBox")
+        meta = QFormLayout(meta_box)
+        meta.setLabelAlignment(Qt.AlignRight)
+        meta.setContentsMargins(12, 12, 12, 12)
+        meta.setHorizontalSpacing(14)
+        meta.setVerticalSpacing(6)
+        self.lib_status_val = QLabel()
+        self.lib_size_val = QLabel()
+        self.lib_downloaded_val = QLabel()
+        self.lib_rates_val = QLabel()
+        self.lib_peers_val = QLabel()
+        self.lib_path_val = QLabel()
+        self.lib_path_val.setWordWrap(True)
+        self.lib_path_val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lib_ratio_val = QLabel()
+        self.lib_pending_val = QLabel()
+        meta.addRow("Статус:", self.lib_status_val)
+        meta.addRow("Размер:", self.lib_size_val)
+        meta.addRow("Скачано:", self.lib_downloaded_val)
+        meta.addRow("Скорости:", self.lib_rates_val)
+        meta.addRow("Пиры:", self.lib_peers_val)
+        meta.addRow("Папка:", self.lib_path_val)
+        meta.addRow("Отдано:", self.lib_ratio_val)
+        meta.addRow("На флешку:", self.lib_pending_val)
+        card.addWidget(meta_box)
+
+        self.lib_progress_bar = QProgressBar()
+        self.lib_progress_bar.setMinimum(0)
+        self.lib_progress_bar.setMaximum(100)
+        card.addWidget(self.lib_progress_bar)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        style = self.style()
+        self.lib_pause_btn = QPushButton("Пауза")
+        self.lib_pause_btn.setIcon(themed_icon("media-playback-pause", style, QStyle.SP_MediaPause))
+        self.lib_pause_btn.clicked.connect(self._lib_pause_toggle)
+        actions.addWidget(self.lib_pause_btn)
+        self.lib_recheck_btn = QPushButton("Проверить")
+        self.lib_recheck_btn.setIcon(themed_icon("view-refresh", style, QStyle.SP_BrowserReload))
+        self.lib_recheck_btn.setToolTip("Принудительная проверка пиров на диске")
+        self.lib_recheck_btn.clicked.connect(self._lib_force_recheck)
+        actions.addWidget(self.lib_recheck_btn)
+        self.lib_open_btn = QPushButton("Папка")
+        self.lib_open_btn.setIcon(themed_icon("folder-open", style, QStyle.SP_DirOpenIcon))
+        self.lib_open_btn.clicked.connect(self._lib_open_current_folder)
+        actions.addWidget(self.lib_open_btn)
+        self.lib_flash_btn_panel = QPushButton("На флешку")
+        self.lib_flash_btn_panel.setIcon(themed_icon("drive-removable-media-usb", style, QStyle.SP_DriveHDIcon))
+        self.lib_flash_btn_panel.setToolTip("Запланировать копирование на флешку (произойдёт при появлении флешки)")
+        self.lib_flash_btn_panel.clicked.connect(self._lib_queue_flash)
+        actions.addWidget(self.lib_flash_btn_panel)
+        actions.addStretch()
+        self.lib_remove_btn = QPushButton("Удалить")
+        self.lib_remove_btn.setIcon(themed_icon("list-remove", style, QStyle.SP_TrashIcon))
+        self.lib_remove_btn.setToolTip("Убрать из раздачи (файлы оставить)")
+        self.lib_remove_btn.clicked.connect(self._lib_remove_current_keep)
+        actions.addWidget(self.lib_remove_btn)
+        self.lib_delete_btn = QPushButton("Удалить + файлы")
+        self.lib_delete_btn.setIcon(themed_icon("edit-delete", style, QStyle.SP_DialogDiscardButton))
+        self.lib_delete_btn.clicked.connect(self._lib_remove_current_delete)
+        actions.addWidget(self.lib_delete_btn)
+        card.addLayout(actions)
+        card.addStretch()
+
+        v.addWidget(self.lib_detail_card)
+        v.addStretch()
+        outer.setWidget(inner)
+        return outer
 
     def _build_list(self) -> QWidget:
         self.table = QTableWidget(0, 5)
@@ -990,27 +1213,33 @@ class MainWindow(QMainWindow):
         meta.addRow("Hash:", self.hash_val)
         card_v.addWidget(meta_box)
 
+        # Информация о флешке + помещается ли торрент
+        self.flash_info = QLabel("")
+        self.flash_info.setObjectName("flashInfo")
+        self.flash_info.setWordWrap(True)
+        card_v.addWidget(self.flash_info)
+
         # Действия
         actions = QHBoxLayout()
         actions.setSpacing(6)
         style = self.style()
         self.copy_btn = QPushButton("Magnet")
-        self.copy_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
+        self.copy_btn.setIcon(themed_icon("edit-copy", style, QStyle.SP_DialogSaveButton))
         self.copy_btn.setToolTip("Скопировать magnet-ссылку в буфер обмена")
         self.copy_btn.clicked.connect(self.copy_magnet)
         actions.addWidget(self.copy_btn)
         self.ktorrent_btn = QPushButton("KTorrent")
-        self.ktorrent_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
+        self.ktorrent_btn.setIcon(themed_icon("ktorrent", style, QStyle.SP_MediaPlay))
         self.ktorrent_btn.clicked.connect(self.open_in_ktorrent)
         actions.addWidget(self.ktorrent_btn)
         self.page_btn = QPushButton("Страница")
-        self.page_btn.setIcon(style.standardIcon(QStyle.SP_DirLinkIcon))
+        self.page_btn.setIcon(themed_icon("internet-web-browser", style, QStyle.SP_DirLinkIcon))
         self.page_btn.clicked.connect(self.open_page)
         actions.addWidget(self.page_btn)
         actions.addStretch()
         self.flash_btn = QPushButton("Скачать → на флешку")
         self.flash_btn.setObjectName("primaryBtn")
-        self.flash_btn.setIcon(style.standardIcon(QStyle.SP_DriveHDIcon))
+        self.flash_btn.setIcon(themed_icon("drive-removable-media-usb", style, QStyle.SP_DriveHDIcon))
         self.flash_btn.clicked.connect(self.download_to_flash)
         actions.addWidget(self.flash_btn)
         card_v.addLayout(actions)
@@ -1043,7 +1272,7 @@ class MainWindow(QMainWindow):
         cancel_row = QHBoxLayout()
         cancel_row.addStretch()
         self.cancel_btn = QPushButton("Отмена")
-        self.cancel_btn.setIcon(style.standardIcon(QStyle.SP_DialogCancelButton))
+        self.cancel_btn.setIcon(themed_icon("process-stop", style, QStyle.SP_DialogCancelButton))
         self.cancel_btn.clicked.connect(self._on_cancel)
         cancel_row.addWidget(self.cancel_btn)
         pv.addLayout(cancel_row)
@@ -1060,13 +1289,17 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = None
             return
-        icon_path = Path(__file__).resolve().parent / "torflash.svg"
-        if not icon_path.exists():
-            # PyInstaller bundle: ресурс лежит в sys._MEIPASS
-            mei = getattr(sys, "_MEIPASS", None)
-            if mei:
-                icon_path = Path(mei) / "torflash.svg"
-        icon = QIcon(str(icon_path)) if icon_path.exists() else self.windowIcon()
+        # Для трея — отдельная упрощённая иконка (без анимаций и мелких деталей)
+        base = Path(__file__).resolve().parent
+        if not base.exists():
+            base = Path(getattr(sys, "_MEIPASS", "."))
+        tray_path = base / "torflash-tray.svg"
+        icon = QIcon(str(tray_path)) if tray_path.exists() else self.windowIcon()
+        # Добавим PNG-варианты разных размеров — KDE предпочитает их при выборе
+        for size in (22, 32, 48):
+            png = base / f"torflash-tray-{size}.png"
+            if png.exists():
+                icon.addFile(str(png))
 
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip(APP_NAME)
@@ -1171,6 +1404,20 @@ class MainWindow(QMainWindow):
             QLabel#banner[kind="info"] {
                 background: #2980b9;
             }
+            QLabel#flashInfo {
+                padding: 6px 10px;
+                border-radius: 4px;
+                background: rgba(40, 167, 69, 0.12);
+                color: #2d7a3f;
+            }
+            QLabel#flashInfo[state="warn"] {
+                background: rgba(192, 57, 43, 0.15);
+                color: #c0392b;
+            }
+            QLabel#flashInfo[state="off"] {
+                background: rgba(127, 127, 127, 0.08);
+                color: #888;
+            }
         """)
 
     # ---------- helpers ----------
@@ -1210,6 +1457,7 @@ class MainWindow(QMainWindow):
         self.leech_val.setText(r["leech"])
         m = MAGNET_HASH_RE.search(r["magnet"])
         self.hash_val.setText(m.group(1) if m else "—")
+        self._refresh_flash_info()
         # показываем прогресс, только если скачивается ИМЕННО этот элемент
         if self.dl_result and self.dl_result["magnet"] == r["magnet"]:
             self._refresh_progress_widget()
@@ -1310,10 +1558,17 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Флешка не обнаружена", 4000)
 
     def eject_flash(self):
+        print("[eject] start", flush=True)
         if self.dl_result is not None:
             self._show_banner("Идёт загрузка — дождитесь завершения перед извлечением")
+            print("[eject] skip: download in progress", flush=True)
+            return
+        if self.copy_worker and self.copy_worker.isRunning():
+            self._show_banner("Идёт копирование на флешку — дождитесь завершения")
+            print("[eject] skip: copy in progress", flush=True)
             return
         mount = detect_flash_mount()
+        print(f"[eject] mount={mount}", flush=True)
         if not mount:
             self._show_banner("Флешка не смонтирована")
             return
@@ -1322,20 +1577,77 @@ class MainWindow(QMainWindow):
                 ["findmnt", "-no", "SOURCE", mount],
                 capture_output=True, text=True, check=True,
             ).stdout.strip()
+            print(f"[eject] device={src}", flush=True)
             if not src:
                 self._show_banner(f"Не удалось определить устройство для {mount}")
                 return
-            # /dev/sdb1 → /dev/sdb (parent disk)
             parent = re.sub(r"\d+$", "", src)
-            subprocess.run(
+            print(f"[eject] parent={parent}", flush=True)
+
+            # Сначала syncим
+            subprocess.run(["sync"], check=False)
+
+            unmount_res = subprocess.run(
                 ["udisksctl", "unmount", "-b", src],
-                check=True, capture_output=True, text=True,
+                capture_output=True, text=True,
             )
-            subprocess.run(
+            print(
+                f"[eject] unmount rc={unmount_res.returncode} "
+                f"stdout={unmount_res.stdout.strip()!r} "
+                f"stderr={unmount_res.stderr.strip()!r}",
+                flush=True,
+            )
+            if unmount_res.returncode != 0:
+                # Узнаём, кто держит
+                busy = ""
+                try:
+                    lsof = subprocess.run(
+                        ["lsof", "+D", mount],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    print(f"[eject] lsof rc={lsof.returncode}", flush=True)
+                    lines = [l for l in lsof.stdout.splitlines() if l and not l.startswith("COMMAND")]
+                    print(f"[eject] lsof lines: {len(lines)}", flush=True)
+                    if lines:
+                        # Берём имя процесса и PID — colонки 1 и 2
+                        procs = set()
+                        for l in lines[:20]:
+                            parts = l.split()
+                            if len(parts) >= 2:
+                                procs.add(f"{parts[0]}({parts[1]})")
+                        busy = ", ".join(sorted(procs))
+                        print(f"[eject] busy: {busy}", flush=True)
+                except (FileNotFoundError, subprocess.SubprocessError) as e:
+                    print(f"[eject] lsof not available: {e}", flush=True)
+                err_msg = (unmount_res.stderr or unmount_res.stdout or "").strip()
+                msg = f"Не удалось размонтировать: {err_msg}"
+                if busy:
+                    msg += f"\nДержат: {busy}"
+                self._show_banner(msg)
+                return
+
+            poff = subprocess.run(
                 ["udisksctl", "power-off", "-b", parent],
-                check=True, capture_output=True, text=True,
+                capture_output=True, text=True,
             )
-            self._show_banner(f"Флешка извлечена ({src}) — можно вынимать", kind="info")
+            print(
+                f"[eject] power-off rc={poff.returncode} "
+                f"stdout={poff.stdout.strip()!r} "
+                f"stderr={poff.stderr.strip()!r}",
+                flush=True,
+            )
+            if poff.returncode != 0:
+                # unmount удался, но power-off нет — флешка размонтирована, можно вынимать
+                self._show_banner(
+                    f"Размонтировано, но power-off не сработал: "
+                    f"{(poff.stderr or poff.stdout).strip()}. "
+                    "Можно вынимать.",
+                    kind="info",
+                )
+            else:
+                self._show_banner(
+                    f"Флешка извлечена ({src}) — можно вынимать", kind="info"
+                )
             # Переходим в режим ~/Storage
             self.flash_check.blockSignals(True)
             self.flash_check.setChecked(False)
@@ -1343,11 +1655,12 @@ class MainWindow(QMainWindow):
             self.dst_dir = str(Path.home() / "Storage")
             self.dst_edit.setText(self.dst_dir)
             self.statusBar().showMessage("Флешка безопасно извлечена", 5000)
-        except subprocess.CalledProcessError as e:
-            err = (e.stderr or "").strip() or str(e)
-            self._show_banner(f"Не удалось извлечь: {err}")
         except FileNotFoundError as e:
+            print(f"[eject] tool missing: {e}", flush=True)
             self._show_banner(f"Утилита не найдена: {e}")
+        except subprocess.SubprocessError as e:
+            print(f"[eject] subprocess error: {e}", flush=True)
+            self._show_banner(f"Ошибка: {e}")
 
     # ---------- actions ----------
 
@@ -1401,7 +1714,8 @@ class MainWindow(QMainWindow):
         self.flash_btn.setEnabled(False)
 
         self.dl_worker = DownloadWorker(
-            self.seed, r["magnet"], str(STORAGE_DEFAULT), r.get("torrent_url", "")
+            self.seed, r["magnet"], str(STORAGE_DEFAULT), r.get("torrent_url", ""),
+            mark_pending_flash=self.flash_check.isChecked(),
         )
         self.dl_worker.progress.connect(self._on_dl_progress)
         self.dl_worker.done.connect(self._on_dl_done)
@@ -1471,6 +1785,10 @@ class MainWindow(QMainWindow):
 
     def _on_copy_done(self, report: list):
         summary = " · ".join(line for line in report)
+        # Сбрасываем pending_flash_copy для активного торрента
+        if self.dl_worker and self.dl_worker.info_hash in self.seed.library:
+            self.seed.library[self.dl_worker.info_hash].pop("pending_flash_copy", None)
+            self.seed._save_library()
         self._reset_dl_state()
         self.statusBar().showMessage(f"Готово: {summary}", 8000)
         self._show_banner(
@@ -1496,15 +1814,154 @@ class MainWindow(QMainWindow):
         self.progress_box.setVisible(False)
         self.flash_btn.setEnabled(True)
 
+    # ---------- flash info ----------
+
+    def _refresh_flash_info(self):
+        if not hasattr(self, "flash_info"):
+            return
+        mount = detect_flash_mount()
+        r = self.current_result()
+        torrent_size = parse_size_text(r["size"]) if r else 0
+
+        def set_state(state: str):
+            self.flash_info.setProperty("state", state)
+            self.flash_info.style().unpolish(self.flash_info)
+            self.flash_info.style().polish(self.flash_info)
+
+        if not mount:
+            self.flash_info.setText("Флешка не подключена — копирование пропустим")
+            set_state("off")
+            return
+        try:
+            usage = shutil.disk_usage(mount)
+        except OSError as e:
+            self.flash_info.setText(f"Ошибка чтения {mount}: {e}")
+            set_state("warn")
+            return
+        fs = ""
+        try:
+            res = subprocess.run(
+                ["findmnt", "-no", "FSTYPE", mount],
+                capture_output=True, text=True, check=True, timeout=2,
+            )
+            fs = res.stdout.strip()
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            pass
+        label = Path(mount).name
+        text = (
+            f"Флешка <b>{label}</b> ({mount})"
+            + (f" · {fs}" if fs else "")
+            + f" · свободно <b>{human_bytes(usage.free)}</b> из {human_bytes(usage.total)}"
+        )
+        if torrent_size > 0:
+            text += f"<br/>Размер торрента: <b>{human_bytes(torrent_size)}</b>"
+            if torrent_size > usage.free:
+                need = torrent_size - usage.free
+                text += f" — <b>не помещается</b>, не хватает {human_bytes(need)}"
+                set_state("warn")
+            else:
+                left = usage.free - torrent_size
+                text += f" — после копирования останется {human_bytes(left)}"
+                set_state("ok")
+        else:
+            set_state("ok")
+        self.flash_info.setText(text)
+
     # ---------- library / seeding ----------
 
     def _refresh_library(self):
         rows = self.seed.all_statuses()
-        # Сортируем: незавершённые сверху, потом по убыванию upload_rate
         rows.sort(key=lambda r: (r["progress"] >= 1.0, -r["upload_rate"]))
         self.lib_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
             self._set_lib_row(i, r)
+        self._check_pending_flash_copies(rows)
+        self._refresh_lib_detail()
+
+    def _check_pending_flash_copies(self, rows: list):
+        """Если торрент завершён и помечен pending_flash_copy — копируем на флешку.
+
+        Работает и после перезапуска: флаг хранится в library.json."""
+        if self.copy_worker and self.copy_worker.isRunning():
+            return
+        if self.dl_worker and self.dl_worker.isRunning():
+            # Свой обработчик _on_dl_done сам разберётся
+            return
+        mount = detect_flash_mount()
+        if not mount:
+            return
+        for r in rows:
+            if not r["is_seeding"] and r["progress"] < 1.0:
+                continue
+            meta = self.seed.library.get(r["hash"], {})
+            if not meta.get("pending_flash_copy"):
+                continue
+            handle = self.seed.handles.get(r["hash"])
+            if not handle:
+                continue
+            info = handle.torrent_file()
+            if not info:
+                continue
+            files = info.files()
+            rel_paths = [files.file_path(i) for i in range(files.num_files())]
+            target = str(Path(mount) / "Movies")
+            try:
+                Path(target).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[flash] mkdir failed: {e}", flush=True)
+                return
+            print(f"[flash] auto-copy {r['title'][:60]} → {target}", flush=True)
+            self._pending_copy_hash = r["hash"]
+            self._pending_copy_title = r["title"]
+            self.copy_worker = CopyWorker(meta["save_path"], rel_paths, target, FAT32_MAX_PART)
+            self.copy_worker.progress.connect(self._on_pending_copy_progress)
+            self.copy_worker.done.connect(self._on_pending_copy_done)
+            self.copy_worker.failed.connect(self._on_pending_copy_failed)
+            self.lib_copy_phase.setText(f"Копирую на флешку: {r['title'][:80]}")
+            self.lib_copy_bar.setValue(0)
+            self.lib_copy_status.setText("Подготовка…")
+            self.lib_copy_box.setVisible(True)
+            self.copy_worker.start()
+            self.statusBar().showMessage(
+                f"Копирую на флешку: {r['title'][:60]}", 5000
+            )
+            return  # одна копия за раз
+
+    def _on_pending_copy_progress(self, pct: int, status: str):
+        if hasattr(self, "lib_copy_bar"):
+            self.lib_copy_bar.setValue(pct)
+            self.lib_copy_status.setText(status)
+        self.statusBar().showMessage(f"Флешка: {status}", 2500)
+
+    def _on_pending_copy_done(self, report: list):
+        hid = getattr(self, "_pending_copy_hash", None)
+        if hid and hid in self.seed.library:
+            self.seed.library[hid].pop("pending_flash_copy", None)
+            self.seed._save_library()
+        self._pending_copy_hash = None
+        self.copy_worker = None
+        if hasattr(self, "lib_copy_box"):
+            self.lib_copy_box.setVisible(False)
+        self.statusBar().showMessage("Скопировано на флешку", 5000)
+        if self.tray:
+            self.tray.showMessage(
+                APP_NAME,
+                f"Скопировано на флешку: {getattr(self, '_pending_copy_title', '')[:80]}",
+                QSystemTrayIcon.Information,
+                4000,
+            )
+
+    def _on_pending_copy_failed(self, err: str):
+        self._pending_copy_hash = None
+        self.copy_worker = None
+        if hasattr(self, "lib_copy_box"):
+            self.lib_copy_box.setVisible(False)
+        if err != "Отменено":
+            self.statusBar().showMessage(f"Не удалось скопировать на флешку: {err}", 5000)
+
+    def _cancel_pending_copy(self):
+        if self.copy_worker and self.copy_worker.isRunning():
+            self.copy_worker.cancel()
 
     def _set_lib_row(self, i: int, r: dict):
         title_item = QTableWidgetItem(r["title"] or "(метаданные…)")
@@ -1512,7 +1969,7 @@ class MainWindow(QMainWindow):
         size_item = QTableWidgetItem(human_bytes(r["size"]) if r["size"] else "?")
         pct = int(r["progress"] * 100)
         if r["is_seeding"] or pct == 100:
-            prog_text = f"🟢 раздача"
+            prog_text = "раздача"
         elif r["has_metadata"]:
             prog_text = f"{r['state']} {pct}%"
         else:
@@ -1565,6 +2022,143 @@ class MainWindow(QMainWindow):
         self._refresh_library()
         msg = "Удалено вместе с файлами" if delete_files else "Убрано из раздачи"
         self.statusBar().showMessage(msg, 3000)
+
+    def _selected_lib_hash(self):
+        row = self.lib_table.currentRow()
+        if row < 0:
+            return None
+        item = self.lib_table.item(row, 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _on_lib_selection_changed(self):
+        if not self._selected_lib_hash():
+            self.lib_detail_card.setVisible(False)
+            self.lib_empty.setVisible(True)
+            return
+        self._refresh_lib_detail()
+
+    def _refresh_lib_detail(self):
+        hid = self._selected_lib_hash()
+        if not hid:
+            return
+        s = self.seed.get_status(hid)
+        h = self.seed.handles.get(hid)
+        if not s or not h:
+            self.lib_detail_card.setVisible(False)
+            self.lib_empty.setVisible(True)
+            return
+        self.lib_empty.setVisible(False)
+        self.lib_detail_card.setVisible(True)
+
+        st = h.status()
+        paused = bool(getattr(st, "paused", False)) or bool(getattr(st, "auto_managed", True)) is False and bool(getattr(st, "paused", False))
+        try:
+            paused = bool(st.paused)
+        except AttributeError:
+            paused = False
+
+        self.lib_title.setText(s["title"])
+        if paused:
+            status = "На паузе"
+        elif s["is_seeding"]:
+            status = "Раздаётся"
+        elif s["has_metadata"]:
+            status = f"{s['state']} {int(s['progress'] * 100)}%"
+        else:
+            status = "Получение метаданных…"
+        self.lib_status_val.setText(status)
+        self.lib_size_val.setText(human_bytes(s["size"]) if s["size"] else "?")
+        if s["size"]:
+            downloaded = s["progress"] * s["size"]
+            self.lib_downloaded_val.setText(
+                f"{human_bytes(downloaded)} ({int(s['progress'] * 100)}%)"
+            )
+        else:
+            self.lib_downloaded_val.setText(f"{int(s['progress'] * 100)}%")
+        self.lib_rates_val.setText(
+            f"↓ {human_bytes(s['download_rate'])}/s · ↑ {human_bytes(s['upload_rate'])}/s"
+        )
+        self.lib_peers_val.setText(f"{s['num_peers']} (сидов: {s['num_seeds']})")
+        self.lib_path_val.setText(s["save_path"])
+        total_up = getattr(st, "total_payload_upload", 0) or 0
+        total_done = max(1, int(s["progress"] * s["size"])) if s["size"] else 1
+        ratio = total_up / total_done if total_done else 0
+        self.lib_ratio_val.setText(f"{human_bytes(total_up)} (ratio {ratio:.2f})")
+        pending = self.seed.library.get(hid, {}).get("pending_flash_copy", False)
+        self.lib_pending_val.setText("✓ запланировано" if pending else "—")
+        self.lib_progress_bar.setValue(int(s["progress"] * 100))
+        self.lib_progress_bar.setProperty(
+            "phase", "copy" if s["is_seeding"] else "dl"
+        )
+        self.lib_progress_bar.style().unpolish(self.lib_progress_bar)
+        self.lib_progress_bar.style().polish(self.lib_progress_bar)
+
+        style = self.style()
+        if paused:
+            self.lib_pause_btn.setText("Возобновить")
+            self.lib_pause_btn.setIcon(themed_icon("media-playback-start", style, QStyle.SP_MediaPlay))
+        else:
+            self.lib_pause_btn.setText("Пауза")
+            self.lib_pause_btn.setIcon(themed_icon("media-playback-pause", style, QStyle.SP_MediaPause))
+        self.lib_flash_btn_panel.setEnabled(not pending)
+
+    def _lib_pause_toggle(self):
+        hid = self._selected_lib_hash()
+        if not hid:
+            return
+        h = self.seed.handles.get(hid)
+        if not h:
+            return
+        try:
+            if h.status().paused:
+                h.resume()
+            else:
+                h.pause()
+        except AttributeError:
+            pass
+        self._refresh_lib_detail()
+
+    def _lib_force_recheck(self):
+        hid = self._selected_lib_hash()
+        if not hid:
+            return
+        h = self.seed.handles.get(hid)
+        if h:
+            try:
+                h.force_recheck()
+                self.statusBar().showMessage("Перепроверка пиров запущена", 3000)
+            except AttributeError as e:
+                self.statusBar().showMessage(f"recheck недоступен: {e}", 3000)
+
+    def _lib_open_current_folder(self):
+        hid = self._selected_lib_hash()
+        if hid:
+            self._lib_open_folder(hid)
+
+    def _lib_queue_flash(self):
+        hid = self._selected_lib_hash()
+        if not hid:
+            return
+        meta = self.seed.library.get(hid)
+        if not meta:
+            return
+        meta["pending_flash_copy"] = True
+        self.seed._save_library()
+        self.statusBar().showMessage(
+            "Запланировано — скопируем при появлении флешки", 4000
+        )
+        self._check_pending_flash_copies(self.seed.all_statuses())
+        self._refresh_lib_detail()
+
+    def _lib_remove_current_keep(self):
+        hid = self._selected_lib_hash()
+        if hid:
+            self._lib_remove(hid, delete_files=False)
+
+    def _lib_remove_current_delete(self):
+        hid = self._selected_lib_hash()
+        if hid:
+            self._lib_remove(hid, delete_files=True)
 
     # ---------- updater ----------
 
@@ -1657,18 +2251,50 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Проверка обновлений не удалась: {err}", 5000)
 
 
+def setup_icon_theme():
+    """Гарантируем что QIcon.fromTheme(name) находит системные иконки.
+    Под PyInstaller/некоторыми DE дефолтные пути не включают /usr/share/icons."""
+    paths = list(QIcon.themeSearchPaths())
+    for p in (
+        "/usr/share/icons",
+        str(Path.home() / ".local" / "share" / "icons"),
+        str(Path.home() / ".icons"),
+    ):
+        if p not in paths and Path(p).exists():
+            paths.append(p)
+    QIcon.setThemeSearchPaths(paths)
+    if not QIcon.themeName() or QIcon.themeName() == "hicolor":
+        for theme in ("breeze", "Adwaita", "Papirus", "gnome", "oxygen"):
+            for base in paths:
+                if (Path(base) / theme / "index.theme").exists():
+                    QIcon.setThemeName(theme)
+                    return
+
+
 def main():
+    # При запуске бинарника без терминала перенаправляем логи в файл
+    if getattr(sys, "frozen", False):
+        try:
+            LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LIBRARY_DIR / "torflash.log"
+            f = open(log_path, "a", buffering=1)
+            sys.stdout = f
+            sys.stderr = f
+            print(f"\n=== {APP_NAME} v{APP_VERSION} started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
+        except OSError:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)  # окно скрывается в трей — не выходим
+    setup_icon_theme()
     icon_path = Path(__file__).resolve().parent / "torflash.svg"
     if not icon_path.exists():
         mei = getattr(sys, "_MEIPASS", None)
         if mei:
             icon_path = Path(mei) / "torflash.svg"
     if icon_path.exists():
-        from PyQt5.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
 
