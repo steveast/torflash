@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "steveast/torflash"
 
 import json
@@ -33,12 +33,35 @@ EXTRA_TRACKERS = [
     "http://tracker.openbittorrent.com:80/announce",
     "http://retracker.local/announce",
 ]
+
+# Категории rutor.info: id → название.
+# URL поиска: /search/0/<cat>/000/0/<query>; <cat>=0 — все.
+RUTOR_CATEGORIES = [
+    (0, "Все"),
+    (1, "Зарубежные фильмы"),
+    (5, "Наше кино"),
+    (4, "Зарубежные сериалы"),
+    (16, "Наши сериалы"),
+    (7, "Мультфильмы"),
+    (8, "Игры"),
+    (9, "Аниме"),
+    (10, "Музыка"),
+    (11, "Книги"),
+    (12, "Спорт и здоровье"),
+    (13, "Юмор"),
+    (14, "Документальные"),
+    (15, "Софт"),
+    (17, "Зарубежные мультфильмы"),
+]
+SEARCH_HISTORY_MAX = 30
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QGuiApplication, QIcon
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QCheckBox,
+    QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -54,12 +77,14 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QStyle,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -412,6 +437,17 @@ class SeedSession:
             if h.is_valid() and h.status().has_metadata:
                 h.save_resume_data()
 
+    def apply_rate_limits(self, down_kbps: int, up_kbps: int):
+        """0 — без ограничений. libtorrent ждёт байты/с."""
+        try:
+            settings = self.ses.get_settings()
+            settings["download_rate_limit"] = down_kbps * 1024 if down_kbps > 0 else 0
+            settings["upload_rate_limit"] = up_kbps * 1024 if up_kbps > 0 else 0
+            self.ses.apply_settings(settings)
+            print(f"[seed] rate limits: ↓{down_kbps}KB/s ↑{up_kbps}KB/s", flush=True)
+        except (AttributeError, RuntimeError) as e:
+            print(f"[seed] apply_rate_limits failed: {e}", flush=True)
+
     def shutdown(self):
         self.request_save_resume_all()
         deadline = time.monotonic() + 5
@@ -748,14 +784,18 @@ class SearchWorker(QThread):
     done = pyqtSignal(list, str)
     failed = pyqtSignal(str)
 
-    def __init__(self, query: str):
+    def __init__(self, query: str, category: int = 0):
         super().__init__()
         self.query = query
+        self.category = category
 
     def run(self):
         last_err = ""
         for base in MIRRORS:
-            url = f"{base}/search/{quote(self.query)}"
+            if self.category:
+                url = f"{base}/search/0/{self.category}/000/0/{quote(self.query)}"
+            else:
+                url = f"{base}/search/{quote(self.query)}"
             try:
                 r = requests.get(url, headers=HEADERS, timeout=10)
                 r.raise_for_status()
@@ -770,6 +810,47 @@ class SearchWorker(QThread):
 MAGNET_HASH_RE = re.compile(r"btih:([a-f0-9]+)", re.I)
 
 
+class MetaFetcher(QThread):
+    """Фоновое получение детальной инфы о торренте с rutor.info."""
+
+    fetched = pyqtSignal(str, dict)  # url, details
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            from rutor_meta import fetch_torrent_details
+        except ImportError as e:
+            print(f"[meta] rutor_meta module missing: {e}", flush=True)
+            return
+        try:
+            data = fetch_torrent_details(self.url)
+            self.fetched.emit(self.url, data)
+        except Exception as e:
+            print(f"[meta] fetch failed: {e}", flush=True)
+
+
+class PosterFetcher(QThread):
+    """Фоновая загрузка картинки постера."""
+
+    loaded = pyqtSignal(str, bytes)  # url, image_bytes
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            r = requests.get(self.url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            if len(r.content) > 0:
+                self.loaded.emit(self.url, r.content)
+        except (requests.RequestException, OSError) as e:
+            print(f"[poster] fetch failed: {e}", flush=True)
+
+
 def themed_icon(name: str, style=None, fallback=None) -> QIcon:
     """Сначала пробуем иконку из системной темы (Breeze, Adwaita, …),
     затем — стандартную из Qt-стиля. Возвращаем пустую QIcon в крайнем случае."""
@@ -782,6 +863,8 @@ def themed_icon(name: str, style=None, fallback=None) -> QIcon:
 
 
 class SettingsDialog(QDialog):
+    applied = pyqtSignal()
+
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} — настройки")
@@ -789,21 +872,55 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(self)
         v.setSpacing(10)
 
+        # Поведение окна
         self.cb_minimize = QCheckBox("Сворачивать в трей при закрытии окна")
         self.cb_minimize.setChecked(
             settings.value("minimize_on_close", True, type=bool)
         )
         v.addWidget(self.cb_minimize)
-
         self.cb_autostart = QCheckBox("Запускать при входе в систему")
         self.cb_autostart.setChecked(AUTOSTART_FILE.exists())
         v.addWidget(self.cb_autostart)
-
         self.cb_hidden = QCheckBox("Скрытый старт (только иконка в трее)")
         self.cb_hidden.setChecked(
             settings.value("start_hidden", False, type=bool)
         )
         v.addWidget(self.cb_hidden)
+        self.cb_auto_update = QCheckBox("Автоматически проверять обновления (раз в сутки)")
+        self.cb_auto_update.setChecked(
+            settings.value("auto_check_updates", True, type=bool)
+        )
+        v.addWidget(self.cb_auto_update)
+
+        # Тема
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Тема:"))
+        self.cb_theme = QComboBox()
+        for label, val in (("Системная", "auto"), ("Светлая", "light"), ("Тёмная", "dark")):
+            self.cb_theme.addItem(label, val)
+        current_theme = settings.value("theme", "auto", type=str)
+        for i in range(self.cb_theme.count()):
+            if self.cb_theme.itemData(i) == current_theme:
+                self.cb_theme.setCurrentIndex(i)
+                break
+        theme_row.addWidget(self.cb_theme, 1)
+        v.addLayout(theme_row)
+
+        # Лимиты скорости
+        v.addWidget(QLabel("<b>Лимиты скорости</b> (КБ/с, 0 — без ограничений):"))
+        rate_form = QFormLayout()
+        rate_form.setHorizontalSpacing(10)
+        self.sp_down = QSpinBox()
+        self.sp_down.setRange(0, 1_000_000)
+        self.sp_down.setSuffix(" КБ/с")
+        self.sp_down.setValue(settings.value("rate_limit_down", 0, type=int))
+        self.sp_up = QSpinBox()
+        self.sp_up.setRange(0, 1_000_000)
+        self.sp_up.setSuffix(" КБ/с")
+        self.sp_up.setValue(settings.value("rate_limit_up", 0, type=int))
+        rate_form.addRow("Скачивание ↓:", self.sp_down)
+        rate_form.addRow("Раздача ↑:", self.sp_up)
+        v.addLayout(rate_form)
 
         info = QLabel(
             "Скачивание всегда идёт в <b>~/Storage</b>. Файлы хранятся там до "
@@ -821,7 +938,12 @@ class SettingsDialog(QDialog):
     def _apply(self):
         self.settings.setValue("minimize_on_close", self.cb_minimize.isChecked())
         self.settings.setValue("start_hidden", self.cb_hidden.isChecked())
+        self.settings.setValue("auto_check_updates", self.cb_auto_update.isChecked())
+        self.settings.setValue("theme", self.cb_theme.currentData())
+        self.settings.setValue("rate_limit_down", int(self.sp_down.value()))
+        self.settings.setValue("rate_limit_up", int(self.sp_up.value()))
         self._apply_autostart(self.cb_autostart.isChecked())
+        self.applied.emit()
         self.accept()
 
     def _apply_autostart(self, enabled: bool):
@@ -895,6 +1017,13 @@ class MainWindow(QMainWindow):
         self._flash_timer.setInterval(5000)
         self._flash_timer.timeout.connect(self._refresh_flash_info)
         self._flash_timer.start()
+        # Авто-проверка обновлений раз в сутки
+        self._auto_update_timer = QTimer(self)
+        self._auto_update_timer.setInterval(24 * 60 * 60 * 1000)
+        self._auto_update_timer.timeout.connect(self._maybe_check_updates)
+        self._auto_update_timer.start()
+        # Применяем сохранённые настройки скорости и темы
+        self._apply_settings()
         self._refresh_library()
 
     # ---------- UI building ----------
@@ -910,6 +1039,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_search_tab(), "Поиск")
         tabs.addTab(self._build_library_tab(), "Моя раздача")
+        tabs.addTab(self._build_flash_tab(), "Флешка")
+        tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(tabs, 1)
         self.tabs = tabs
 
@@ -921,12 +1052,26 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(0, 6, 0, 0)
         v.setSpacing(8)
 
-        # Поисковая строка
+        # Поисковая строка с категорией
         search_row = QHBoxLayout()
-        search_row.addWidget(QLabel("Запрос:"))
+        self.category_combo = QComboBox()
+        for cid, name in RUTOR_CATEGORIES:
+            self.category_combo.addItem(name, cid)
+        last_cat = self.settings.value("last_category", 0, type=int)
+        for i, (cid, _) in enumerate(RUTOR_CATEGORIES):
+            if cid == last_cat:
+                self.category_combo.setCurrentIndex(i)
+                break
+        search_row.addWidget(self.category_combo)
         self.input = QLineEdit()
         self.input.setPlaceholderText("Название фильма, игры, дистрибутива…")
         self.input.returnPressed.connect(self.start_search)
+        # История запросов: QCompleter
+        history = self.settings.value("search_history", [], type=list) or []
+        self._search_history = list(history)
+        self.search_completer = QCompleter(self._search_history)
+        self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.input.setCompleter(self.search_completer)
         search_row.addWidget(self.input, 1)
         self.search_btn = QPushButton("Искать")
         self.search_btn.setDefault(True)
@@ -1043,6 +1188,155 @@ class MainWindow(QMainWindow):
         self.lib_table.itemSelectionChanged.connect(self._on_lib_selection_changed)
         return self.lib_table
 
+    def _build_flash_tab(self) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 8, 0, 0)
+        v.setSpacing(8)
+        self.flash_summary = QLabel("Флешка не подключена")
+        self.flash_summary.setObjectName("flashInfo")
+        self.flash_summary.setProperty("state", "off")
+        v.addWidget(self.flash_summary)
+
+        actions = QHBoxLayout()
+        self.flash_refresh_btn = QPushButton("Обновить")
+        self.flash_refresh_btn.setIcon(
+            themed_icon("view-refresh", self.style(), QStyle.SP_BrowserReload)
+        )
+        self.flash_refresh_btn.clicked.connect(self._refresh_flash_tab)
+        actions.addWidget(self.flash_refresh_btn)
+        self.flash_open_btn = QPushButton("Открыть папку")
+        self.flash_open_btn.setIcon(
+            themed_icon("folder-open", self.style(), QStyle.SP_DirOpenIcon)
+        )
+        self.flash_open_btn.clicked.connect(self._open_flash_folder)
+        actions.addWidget(self.flash_open_btn)
+        self.flash_eject_btn = QPushButton("Безопасно извлечь")
+        self.flash_eject_btn.setIcon(
+            themed_icon("media-eject", self.style(), QStyle.SP_DialogCancelButton)
+        )
+        self.flash_eject_btn.clicked.connect(self.eject_flash)
+        actions.addWidget(self.flash_eject_btn)
+        actions.addStretch()
+        v.addLayout(actions)
+
+        self.flash_files_table = QTableWidget(0, 3)
+        self.flash_files_table.setHorizontalHeaderLabels(["Файл", "Размер", "Изменён"])
+        self.flash_files_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.flash_files_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.flash_files_table.setAlternatingRowColors(True)
+        self.flash_files_table.verticalHeader().setVisible(False)
+        fh = self.flash_files_table.horizontalHeader()
+        fh.setSectionResizeMode(0, QHeaderView.Stretch)
+        fh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        fh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.flash_files_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.flash_files_table.customContextMenuRequested.connect(self._flash_file_menu)
+        v.addWidget(self.flash_files_table, 1)
+
+        return wrap
+
+    def _on_tab_changed(self, index: int):
+        if index == 2:
+            self._refresh_flash_tab()
+
+    def _refresh_flash_tab(self):
+        mount = detect_flash_mount()
+        if not mount:
+            self.flash_summary.setText("Флешка не подключена")
+            self.flash_summary.setProperty("state", "off")
+            self.flash_summary.style().unpolish(self.flash_summary)
+            self.flash_summary.style().polish(self.flash_summary)
+            self.flash_files_table.setRowCount(0)
+            return
+        try:
+            usage = shutil.disk_usage(mount)
+            fs = ""
+            try:
+                fs = subprocess.run(
+                    ["findmnt", "-no", "FSTYPE", mount],
+                    capture_output=True, text=True, check=True, timeout=2,
+                ).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                pass
+            self.flash_summary.setText(
+                f"<b>{Path(mount).name}</b> ({mount})"
+                + (f" · {fs}" if fs else "")
+                + f" · свободно <b>{human_bytes(usage.free)}</b> из {human_bytes(usage.total)}"
+            )
+            free_ratio = usage.free / usage.total if usage.total else 1
+            self.flash_summary.setProperty(
+                "state", "warn" if free_ratio < 0.1 else "ok"
+            )
+            self.flash_summary.style().unpolish(self.flash_summary)
+            self.flash_summary.style().polish(self.flash_summary)
+        except OSError as e:
+            self.flash_summary.setText(f"Ошибка: {e}")
+            return
+        # Перечислим содержимое /Movies (если есть) или корня
+        target = Path(mount) / "Movies"
+        if not target.exists():
+            target = Path(mount)
+        rows = []
+        try:
+            for p in sorted(target.rglob("*")):
+                if p.is_file():
+                    try:
+                        st = p.stat()
+                        rows.append((p.relative_to(mount), st.st_size, st.st_mtime))
+                    except OSError:
+                        continue
+        except OSError as e:
+            self.flash_summary.setText(f"Ошибка чтения: {e}")
+            return
+        self.flash_files_table.setRowCount(len(rows))
+        for i, (rel, size, mtime) in enumerate(rows):
+            it_name = QTableWidgetItem(str(rel))
+            it_size = QTableWidgetItem(human_bytes(size))
+            it_size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            it_mtime = QTableWidgetItem(time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)))
+            for col, it in enumerate((it_name, it_size, it_mtime)):
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.flash_files_table.setItem(i, col, it)
+
+    def _open_flash_folder(self):
+        mount = detect_flash_mount()
+        if mount:
+            try:
+                subprocess.Popen(["xdg-open", mount])
+            except OSError as e:
+                self.statusBar().showMessage(f"Ошибка: {e}", 3000)
+
+    def _flash_file_menu(self, pos):
+        item = self.flash_files_table.itemAt(pos)
+        if not item:
+            return
+        row = item.row()
+        name_item = self.flash_files_table.item(row, 0)
+        if not name_item:
+            return
+        mount = detect_flash_mount()
+        if not mount:
+            return
+        full = Path(mount) / name_item.text()
+        menu = QMenu(self)
+        act_open = menu.addAction("Открыть")
+        act_open.triggered.connect(
+            lambda: subprocess.Popen(["xdg-open", str(full)])
+        )
+        menu.addSeparator()
+        act_del = menu.addAction("Удалить с флешки")
+        act_del.triggered.connect(lambda: self._flash_delete_file(full))
+        menu.exec_(self.flash_files_table.viewport().mapToGlobal(pos))
+
+    def _flash_delete_file(self, path: Path):
+        try:
+            path.unlink(missing_ok=True)
+            self._refresh_flash_tab()
+            self.statusBar().showMessage(f"Удалено: {path.name}", 3000)
+        except OSError as e:
+            self.statusBar().showMessage(f"Ошибка удаления: {e}", 4000)
+
     def _build_library_detail(self) -> QWidget:
         outer = QScrollArea()
         outer.setWidgetResizable(True)
@@ -1086,6 +1380,9 @@ class MainWindow(QMainWindow):
         self.lib_path_val.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lib_ratio_val = QLabel()
         self.lib_pending_val = QLabel()
+        self.lib_media_val = QLabel()
+        self.lib_media_val.setStyleSheet("color: #888;")
+        self.lib_media_val.setWordWrap(True)
         meta.addRow("Статус:", self.lib_status_val)
         meta.addRow("Размер:", self.lib_size_val)
         meta.addRow("Скачано:", self.lib_downloaded_val)
@@ -1094,6 +1391,7 @@ class MainWindow(QMainWindow):
         meta.addRow("Папка:", self.lib_path_val)
         meta.addRow("Отдано:", self.lib_ratio_val)
         meta.addRow("На флешку:", self.lib_pending_val)
+        meta.addRow("Медиа:", self.lib_media_val)
         card.addWidget(meta_box)
 
         self.lib_progress_bar = QProgressBar()
@@ -1212,6 +1510,21 @@ class MainWindow(QMainWindow):
         meta.addRow("Личеры:", self.leech_val)
         meta.addRow("Hash:", self.hash_val)
         card_v.addWidget(meta_box)
+
+        # Постер + описание (подгружается асинхронно после выбора)
+        self.poster_label = QLabel()
+        self.poster_label.setAlignment(Qt.AlignCenter)
+        self.poster_label.setMinimumHeight(0)
+        self.poster_label.setVisible(False)
+        card_v.addWidget(self.poster_label)
+        self.description_view = QTextBrowser()
+        self.description_view.setOpenExternalLinks(True)
+        self.description_view.setMaximumHeight(200)
+        self.description_view.setVisible(False)
+        self.description_view.setStyleSheet(
+            "QTextBrowser { background: rgba(127,127,127,0.05); border: none; padding: 8px; }"
+        )
+        card_v.addWidget(self.description_view)
 
         # Информация о флешке + помещается ли торрент
         self.flash_info = QLabel("")
@@ -1338,7 +1651,25 @@ class MainWindow(QMainWindow):
 
     def open_settings(self):
         dlg = SettingsDialog(self.settings, self)
+        dlg.applied.connect(self._apply_settings)
         dlg.exec_()
+
+    def _apply_settings(self):
+        down = self.settings.value("rate_limit_down", 0, type=int)
+        up = self.settings.value("rate_limit_up", 0, type=int)
+        self.seed.apply_rate_limits(down, up)
+        try:
+            from themes import apply_theme
+            theme = self.settings.value("theme", "auto", type=str)
+            apply_theme(QApplication.instance(), theme)
+        except (ImportError, ModuleNotFoundError) as e:
+            print(f"[main] theme module unavailable: {e}", flush=True)
+
+    def _maybe_check_updates(self):
+        if not self.settings.value("auto_check_updates", True, type=bool):
+            return
+        # Скрытая проверка: не показываем «уже свежая»
+        self.check_for_updates(silent=True)
 
     def _tray_quit(self):
         if self.tray:
@@ -1458,6 +1789,42 @@ class MainWindow(QMainWindow):
         m = MAGNET_HASH_RE.search(r["magnet"])
         self.hash_val.setText(m.group(1) if m else "—")
         self._refresh_flash_info()
+        # Сбрасываем постер/описание, запускаем фоновое получение деталей
+        self.poster_label.setVisible(False)
+        self.poster_label.clear()
+        self.description_view.setVisible(False)
+        self.description_view.clear()
+        self._current_meta_url = r["page"]
+        if r["page"]:
+            self._meta_fetcher = MetaFetcher(r["page"])
+            self._meta_fetcher.fetched.connect(self._on_meta_fetched)
+            self._meta_fetcher.start()
+
+    def _on_meta_fetched(self, url: str, data: dict):
+        # Игнорируем если пользователь уже выбрал другой торрент
+        if getattr(self, "_current_meta_url", None) != url:
+            return
+        desc = data.get("description") or ""
+        if desc:
+            self.description_view.setPlainText(desc.strip())
+            self.description_view.setVisible(True)
+        poster_url = data.get("poster_url") or ""
+        if poster_url:
+            self._poster_fetcher = PosterFetcher(poster_url)
+            self._poster_fetcher.loaded.connect(self._on_poster_loaded)
+            self._poster_fetcher.start()
+
+    def _on_poster_loaded(self, url: str, data: bytes):
+        if not data:
+            return
+        from PyQt5.QtGui import QPixmap
+        pix = QPixmap()
+        pix.loadFromData(data)
+        if pix.isNull():
+            return
+        pix = pix.scaledToWidth(280, Qt.SmoothTransformation)
+        self.poster_label.setPixmap(pix)
+        self.poster_label.setVisible(True)
         # показываем прогресс, только если скачивается ИМЕННО этот элемент
         if self.dl_result and self.dl_result["magnet"] == r["magnet"]:
             self._refresh_progress_widget()
@@ -1490,13 +1857,35 @@ class MainWindow(QMainWindow):
             return
         if self.search_worker and self.search_worker.isRunning():
             return
+        category = self.category_combo.currentData() or 0
+        self.settings.setValue("last_category", int(category))
+        self._push_history(query)
         self.search_btn.setEnabled(False)
         self.statusBar().showMessage("Поиск…")
         self._hide_banner()
-        self.search_worker = SearchWorker(query)
+        self.search_worker = SearchWorker(query, category=int(category))
         self.search_worker.done.connect(self._on_search_done)
         self.search_worker.failed.connect(self._on_search_failed)
         self.search_worker.start()
+
+    def _push_history(self, query: str):
+        q = query.strip()
+        if not q:
+            return
+        if q in self._search_history:
+            self._search_history.remove(q)
+        self._search_history.insert(0, q)
+        self._search_history = self._search_history[:SEARCH_HISTORY_MAX]
+        self.settings.setValue("search_history", self._search_history)
+        # Обновляем completer
+        from PyQt5.QtCore import QStringListModel
+        model = self.search_completer.model()
+        if isinstance(model, QStringListModel):
+            model.setStringList(self._search_history)
+        else:
+            self.search_completer = QCompleter(self._search_history)
+            self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
+            self.input.setCompleter(self.search_completer)
 
     def _on_search_done(self, results: list, mirror: str):
         self.search_btn.setEnabled(True)
@@ -1696,13 +2085,29 @@ class MainWindow(QMainWindow):
         r = self.current_result()
         if not r:
             return
-        if self.dl_result is not None:
-            self.statusBar().showMessage("Уже идёт другая загрузка", 3000)
-            return
         try:
             STORAGE_DEFAULT.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             self._show_banner(f"Не удалось создать {STORAGE_DEFAULT}: {e}")
+            return
+        # Если уже идёт загрузка — добавим в очередь
+        if self.dl_result is not None:
+            if not hasattr(self, "_dl_queue"):
+                self._dl_queue = []
+            entry = {
+                "magnet": r["magnet"],
+                "torrent_url": r.get("torrent_url", ""),
+                "title": r["title"],
+                "use_flash": self.flash_check.isChecked(),
+            }
+            # Избегаем дубликатов
+            if not any(q["magnet"] == r["magnet"] for q in self._dl_queue):
+                self._dl_queue.append(entry)
+                self.statusBar().showMessage(
+                    f"В очередь #{len(self._dl_queue)}: {r['title'][:60]}", 4000
+                )
+            else:
+                self.statusBar().showMessage("Уже в очереди", 3000)
             return
         # Если флешка — проверяем доступ дополнительно при копировании.
         self._hide_banner()
@@ -1813,6 +2218,37 @@ class MainWindow(QMainWindow):
         self.dl_progress = (0, "")
         self.progress_box.setVisible(False)
         self.flash_btn.setEnabled(True)
+        # Если есть очередь — стартуем следующий
+        if getattr(self, "_dl_queue", None):
+            next_item = self._dl_queue.pop(0)
+            self.flash_check.blockSignals(True)
+            self.flash_check.setChecked(next_item.get("use_flash", False))
+            self.flash_check.blockSignals(False)
+            fake = {
+                "magnet": next_item["magnet"],
+                "torrent_url": next_item.get("torrent_url", ""),
+                "title": next_item.get("title", ""),
+            }
+            self._start_download_for(fake)
+
+    def _start_download_for(self, r: dict):
+        self._hide_banner()
+        self.dl_result = r
+        self.dl_phase = "dl"
+        self.dl_progress = (0, "Запуск из очереди…")
+        self._refresh_progress_widget()
+        self.progress_box.setVisible(True)
+        self.flash_btn.setEnabled(False)
+        self.dl_worker = DownloadWorker(
+            self.seed, r["magnet"], str(STORAGE_DEFAULT),
+            r.get("torrent_url", ""),
+            mark_pending_flash=self.flash_check.isChecked(),
+        )
+        self.dl_worker.progress.connect(self._on_dl_progress)
+        self.dl_worker.done.connect(self._on_dl_done)
+        self.dl_worker.failed.connect(self._on_dl_failed)
+        self.dl_worker.start()
+        self.statusBar().showMessage(f"Из очереди: {r.get('title','')[:60]}", 4000)
 
     # ---------- flash info ----------
 
@@ -2086,6 +2522,8 @@ class MainWindow(QMainWindow):
         self.lib_ratio_val.setText(f"{human_bytes(total_up)} (ratio {ratio:.2f})")
         pending = self.seed.library.get(hid, {}).get("pending_flash_copy", False)
         self.lib_pending_val.setText("✓ запланировано" if pending else "—")
+        # Медиа-инфо для самого большого .mkv в папке торрента (один раз, кэшируем)
+        self._update_media_info(hid, h, s)
         self.lib_progress_bar.setValue(int(s["progress"] * 100))
         self.lib_progress_bar.setProperty(
             "phase", "copy" if s["is_seeding"] else "dl"
@@ -2101,6 +2539,71 @@ class MainWindow(QMainWindow):
             self.lib_pause_btn.setText("Пауза")
             self.lib_pause_btn.setIcon(themed_icon("media-playback-pause", style, QStyle.SP_MediaPause))
         self.lib_flash_btn_panel.setEnabled(not pending)
+
+    def _update_media_info(self, hid: str, handle, s: dict):
+        if not s.get("has_metadata"):
+            self.lib_media_val.setText("—")
+            return
+        if not hasattr(self, "_media_cache"):
+            self._media_cache = {}
+        if hid in self._media_cache:
+            self.lib_media_val.setText(self._media_cache[hid])
+            return
+        # Ищем самый большой видеофайл
+        try:
+            info = handle.torrent_file()
+            files = info.files()
+            best = None
+            best_size = 0
+            for i in range(files.num_files()):
+                path = files.file_path(i)
+                if path.lower().endswith((".mkv", ".mp4", ".avi", ".m4v", ".mov")):
+                    fs = files.file_size(i)
+                    if fs > best_size:
+                        best_size = fs
+                        best = path
+            if not best:
+                self.lib_media_val.setText("—")
+                self._media_cache[hid] = "—"
+                return
+            full = Path(s["save_path"]) / best
+            if not full.exists():
+                self.lib_media_val.setText("(файл недоступен)")
+                return
+        except Exception as e:
+            self.lib_media_val.setText(f"ошибка: {e}")
+            return
+        # Запускаем фоновую проверку
+        self._media_cache[hid] = "загружаю…"
+        self.lib_media_val.setText("загружаю…")
+
+        class _MediaWorker(QThread):
+            done = pyqtSignal(str, str)
+
+            def __init__(self, hid, path):
+                super().__init__()
+                self.hid = hid
+                self.path = path
+
+            def run(self):
+                try:
+                    from mediainfo import file_info
+                    data = file_info(str(self.path))
+                    summary = data.get("human_summary", "") or "—"
+                except Exception as e:
+                    summary = f"(ошибка: {e})"
+                self.done.emit(self.hid, summary)
+
+        w = _MediaWorker(hid, full)
+        w.done.connect(self._on_media_done)
+        w.start()
+        # Сохраняем ссылку чтобы не GC'нулся
+        self._media_worker = w
+
+    def _on_media_done(self, hid: str, summary: str):
+        self._media_cache[hid] = summary
+        if self._selected_lib_hash() == hid:
+            self.lib_media_val.setText(summary)
 
     def _lib_pause_toggle(self):
         hid = self._selected_lib_hash()
@@ -2162,10 +2665,12 @@ class MainWindow(QMainWindow):
 
     # ---------- updater ----------
 
-    def check_for_updates(self):
+    def check_for_updates(self, silent: bool = False):
         if getattr(self, "update_checker", None) and self.update_checker.isRunning():
             return
-        self.statusBar().showMessage("Проверяю обновление…", 3000)
+        self._update_silent = silent
+        if not silent:
+            self.statusBar().showMessage("Проверяю обновление…", 3000)
         self.update_checker = UpdateChecker()
         self.update_checker.found.connect(self._on_update_found)
         self.update_checker.up_to_date.connect(self._on_up_to_date)
@@ -2245,10 +2750,12 @@ class MainWindow(QMainWindow):
         self._show_banner(f"Не удалось скачать обновление: {err}")
 
     def _on_up_to_date(self, version: str):
-        self.statusBar().showMessage(f"Установлена последняя версия (v{version})", 5000)
+        if not getattr(self, "_update_silent", False):
+            self.statusBar().showMessage(f"Установлена последняя версия (v{version})", 5000)
 
     def _on_update_check_failed(self, err: str):
-        self.statusBar().showMessage(f"Проверка обновлений не удалась: {err}", 5000)
+        if not getattr(self, "_update_silent", False):
+            self.statusBar().showMessage(f"Проверка обновлений не удалась: {err}", 5000)
 
 
 def setup_icon_theme():

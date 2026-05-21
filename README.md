@@ -12,19 +12,36 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
 
 ## Features
 
-- 🔍 **Search** on rutor.info with automatic mirror fallback (`rutor.info`, `rutor.is`, `rutor.org`)
-- 🧲 **Magnet + .torrent**: fetches the `.torrent` straight from rutor — instant metadata, no waiting on DHT
-- 📚 **Persistent library**: every download stays in `~/Storage` and keeps seeding while the app is open
-- 🌱 **Seeding** is restored on startup via `resume_data` + cached `.torrent` files
-- 💾 **Mirror to flash → `Movies`**: auto-detects USB mount in `/run/media/$USER/*`, creates the folder
-- ✂️ **Auto-split** files > 3.9 GiB for FAT32:
-  - **MKV** files are split with `mkvmerge --split size:NM` — each part is a valid playable MKV
-  - Other formats fall back to byte-split with extension preserved (`name.part000.mkv`)
-- ⏏ **Safe eject** with one click (`udisksctl unmount` + `power-off`); shows which process holds the device if busy
-- 🎯 **Open in KTorrent** in one click — for low-seeded torrents
-- 📊 Progress **inline** (blue — download, green — copy), no blocking modals
+### Search
+- 🔍 **Mirror fallback** across `rutor.info`, `rutor.is`, `rutor.org`
+- 📂 **Category filter** — movies / series / cartoons / games / music / books / software / sport / etc.
+- 🕘 **Query history** with autocomplete
+- 🖼 **Poster + description** in the detail panel (parsed from the torrent page)
+- 🧲 **Magnet + .torrent** — fetches `.torrent` straight from rutor for instant metadata
+
+### Library & seeding
+- 📚 **Persistent library**: everything stays in `~/Storage` and keeps seeding while the app is open
+- 🌱 **Seeding restored on startup** via `resume_data` + cached `.torrent` files
+- ⏯ **Pause / Resume / Re-check** per torrent, queue multiple downloads
+- 🎞 **Mediainfo** in detail panel (codec, resolution, audio tracks, duration) via `mediainfo` or `ffprobe`
+
+### Flash drive
+- 💾 **Auto-detect** USB at `/run/media/$USER/*`, copy to `Movies/`
+- ✂️ **Smart splitting** for FAT32 (> 3.9 GiB):
+  - **MKV** via `mkvmerge --split size:NM` — each part is a standalone playable MKV
+  - Other formats — byte-split with the extension preserved (`name.part000.mkv`)
+- 📁 **Flash overview tab**: free space, listed contents, per-file delete, open in file manager
+- ⏏ **Safe eject** (`udisksctl unmount` + `power-off`); shows which process is holding the device if busy
+- 🔁 **Pending flash copy** survives restart — flag stored in `library.json`, auto-copies when the torrent finishes and the flash is back
+
+### App & control
+- 🎯 **Open in KTorrent** in one click
+- 📊 Inline progress in the same panel (blue — download, green — copy), no blocking modals
+- 🎨 **Theme**: auto / light / dark
+- 🚦 **Rate limits** (down / up KB/s) in settings
 - ⚙️ **Settings**: autostart at login, hidden start, minimize-to-tray on close
-- 🔄 **Self-update** from GitHub Releases — option in tray menu
+- 🔄 **Self-update** from GitHub Releases — manual + automatic daily check
+- 🔧 **CLI mode** for headless use: `torflash_cli.py search QUERY | list | download URL | remove HASH`
 
 ## Screenshot
 
