@@ -1,34 +1,38 @@
 # ⚡ TorFlash
 
-> Поиск торрентов на [rutor.info](https://rutor.info), скачивание и автоматическое копирование на USB-флешку с разбиением больших файлов под FAT32.
+English · **[Русский](README.ru.md)**
+
+> Search torrents on [rutor.info](https://rutor.info), download and auto-copy them to a USB flash drive — splitting large files for FAT32 along the way.
 
 <p align="center">
   <img src="screenshot.png" alt="TorFlash screenshot" width="800">
 </p>
 
-Linux-десктоп приложение на PyQt5. Качает напрямую через `libtorrent-rasterbar`, парсит выдачу rutor по HTTP, складывает фильмы на флешку — без болтанки с «вставь флешку, открой ktorrent, дождись, скопируй вручную».
+A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open KTorrent, wait, copy manually" dance.
 
-## Возможности
+## Features
 
-- 🔍 **Поиск** по rutor.info с автоматическим переключением между зеркалами (`rutor.info`, `rutor.is`, `rutor.org`)
-- 🧲 **Magnet + .torrent**: качаем `.torrent` напрямую с rutor — метаданные мгновенно, без зависания на DHT
-- 📚 **Постоянная библиотека**: всё скачанное лежит в `~/Storage`, раздаётся пока приложение запущено
-- 🌱 **Сидинг** с автозагрузкой при старте — resume data, кэш .torrent файлов
-- 💾 **Дублирование на флешку → `Movies`**: автоопределение USB-носителя в `/run/media/$USER/*`, папка создаётся сама
-- ✂️ **Авторазбиение** файлов > 3.9 GiB на части (`movie.mkv.part000`, `.part001`…) — для FAT32
-- ⏏ **Безопасное извлечение** флешки одной кнопкой (`udisksctl unmount` + `power-off`)
-- 🎯 **Открыть в KTorrent** одним кликом — для торрентов с трудной раздачей
-- 📊 Прогресс **в той же панели** (синий — скачивание, зелёный — копирование), без блокирующих модалок
-- ⚙️ **Настройки**: автозапуск при входе в систему, скрытый старт, сворачивание в трей
-- 🔄 **Самообновление** с GitHub Releases — кнопка в меню трея
+- 🔍 **Search** on rutor.info with automatic mirror fallback (`rutor.info`, `rutor.is`, `rutor.org`)
+- 🧲 **Magnet + .torrent**: fetches the `.torrent` straight from rutor — instant metadata, no waiting on DHT
+- 📚 **Persistent library**: every download stays in `~/Storage` and keeps seeding while the app is open
+- 🌱 **Seeding** is restored on startup via `resume_data` + cached `.torrent` files
+- 💾 **Mirror to flash → `Movies`**: auto-detects USB mount in `/run/media/$USER/*`, creates the folder
+- ✂️ **Auto-split** files > 3.9 GiB for FAT32:
+  - **MKV** files are split with `mkvmerge --split size:NM` — each part is a valid playable MKV
+  - Other formats fall back to byte-split with extension preserved (`name.part000.mkv`)
+- ⏏ **Safe eject** with one click (`udisksctl unmount` + `power-off`); shows which process holds the device if busy
+- 🎯 **Open in KTorrent** in one click — for low-seeded torrents
+- 📊 Progress **inline** (blue — download, green — copy), no blocking modals
+- ⚙️ **Settings**: autostart at login, hidden start, minimize-to-tray on close
+- 🔄 **Self-update** from GitHub Releases — option in tray menu
 
-## Скриншот
+## Screenshot
 
-UI: список слева, детальная карточка справа, прогресс встроен в карточку.
+UI: list on the left, detail card on the right, progress embedded in the card.
 
-## Установка
+## Install
 
-### Готовый бинарник (рекомендуется)
+### Pre-built binary (recommended)
 
 ```bash
 mkdir -p ~/Apps/TorFlash && cd ~/Apps/TorFlash
@@ -37,60 +41,69 @@ chmod +x TorFlash
 ./TorFlash
 ```
 
-Бинарник собран через PyInstaller, содержит Python + PyQt5 + libtorrent + requests. Зависит только от системных библиотек: Qt5, glibc, OpenSSL.
+The binary is built with PyInstaller; it bundles Python, PyQt5, libtorrent and requests. Only system libraries are required: Qt5, glibc, OpenSSL.
 
-### Из исходников
+### From source
 
-Нужен Python 3.11+ и системные пакеты (Arch):
+You'll need Python 3.11+ and these system packages (Arch):
 
 ```bash
-sudo pacman -S libtorrent-rasterbar python-pyqt5 python-requests
+sudo pacman -S libtorrent-rasterbar python-pyqt5 python-requests mkvtoolnix-cli
 git clone https://github.com/steveast/torflash.git
 cd torflash
 python3 rutor_search.py
 ```
 
-Для других дистрибутивов: `libtorrent-rasterbar` с Python-биндингами обычно идёт под именем `python3-libtorrent` (Debian/Ubuntu) или `python-libtorrent` (rpm).
+For other distros, `libtorrent-rasterbar` with Python bindings ships as `python3-libtorrent` on Debian/Ubuntu or `python-libtorrent` on rpm-based systems.
 
-## Самосборка бинарника
+## Building the binary yourself
 
 ```bash
 python3 -m venv --system-site-packages .build-venv
 .build-venv/bin/pip install pyinstaller
 .build-venv/bin/pyinstaller --onefile --windowed --name TorFlash \
-    --add-data "torflash.svg:." rutor_search.py
-# Готовый бинарник: dist/TorFlash
+    --add-data "torflash.svg:." \
+    --add-data "torflash-tray.svg:." \
+    --add-data "torflash-tray-22.png:." \
+    --add-data "torflash-tray-32.png:." \
+    --add-data "torflash-tray-48.png:." \
+    rutor_search.py
+# Output: dist/TorFlash
 ```
 
-## Сетевые тонкости
+## Networking notes
 
-Для нестандартных конфигураций (VPN, корпоративная сеть):
+For restrictive networks (VPNs, corporate firewalls):
 
-- UDP-трекеры и DHT-bootstrap могут блокироваться → приложение использует только HTTPS/HTTP трекеры
-- Метаданные берутся **напрямую** из `.torrent` файла с rutor.info (не из DHT)
-- uTP между пирами включён — это TCP-fallback BitTorrent over UDP, работает через NAT
+- UDP trackers and DHT bootstrap may be blocked → the app only uses HTTPS/HTTP trackers
+- Metadata is taken **directly** from rutor's `.torrent` file (no DHT roundtrip needed)
+- uTP between peers stays enabled — that's TCP-fallback BitTorrent over UDP and usually traverses NATs even when raw UDP is filtered
 
-## Использование
+## Usage
 
-1. Введите запрос → Enter
-2. Выберите результат в списке (детали справа)
-3. Двойной клик ИЛИ кнопка «Скачать → на флешку»
-4. Прогресс: синий бар = скачивание, зелёный = копирование
-5. Готово — нажмите ⏏ для безопасного извлечения
+1. Type a query → Enter
+2. Pick a result in the list (details show on the right)
+3. Double-click or press "Download → flash"
+4. Progress: blue = downloading, green = copying
+5. Done — press ⏏ to safely eject
 
-Если флешки нет, снимите галочку «На флешку» — всё сложится в `~/Storage`.
+Uncheck "Mirror to flash" and everything just lands in `~/Storage`.
 
-## Архитектура
+## Architecture
 
-- `rutor_search.py` — единственный модуль (~1500 строк)
-- `SearchWorker` — HTTP-парсинг rutor.info (regex, без BeautifulSoup)
-- `SeedSession` — постоянная `libtorrent.session`, библиотека в `~/.local/share/TorFlash/library.json`, resume data, кэш `.torrent`
-- `DownloadWorker` — добавляет в общую сессию, мониторит прогресс, по завершении оставляет в сидинге
-- `CopyWorker` — потоковое копирование с разбиением на части по 3.9 GiB
-- `UpdateChecker` / `UpdateDownloader` — GitHub Releases API + `os.execv` для перезапуска после обновления
-- `SettingsDialog` — автозапуск (~/.config/autostart/TorFlash.desktop), скрытый старт, сворачивание в трей
-- `MainWindow` — `QTabWidget` (поиск + библиотека), split-view внутри поиска
+- `rutor_search.py` — single module (~1700 lines)
+- `SearchWorker` — rutor.info HTML scraping with regex (no BeautifulSoup)
+- `SeedSession` — persistent `libtorrent.session`, library in `~/.local/share/TorFlash/library.json`, resume data, `.torrent` cache
+- `DownloadWorker` — adds torrents to the shared session, watches progress, leaves them seeding when done
+- `CopyWorker` — streaming copy with MKV-aware splitting (mkvmerge) or fallback byte-split
+- `UpdateChecker` / `UpdateDownloader` — GitHub Releases API + `os.execv` self-restart after update
+- `SettingsDialog` — autostart (`~/.config/autostart/TorFlash.desktop`), hidden start, minimize-to-tray
+- `MainWindow` — `QTabWidget` (search + library tabs), split-views inside each
 
-## Лицензия
+## Logs
+
+When running the bundled binary, logs are written to `~/.local/share/TorFlash/torflash.log`.
+
+## License
 
 MIT
