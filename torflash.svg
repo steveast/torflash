@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2937"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="usb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#94a3b8"/>
+      <stop offset="1" stop-color="#475569"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fde047"/>
+      <stop offset="0.6" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#dc2626"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- фон в виде скруглённого квадрата -->
+  <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bg)"/>
+
+  <!-- P2P-сетка по периметру: узлы и связи -->
+  <g stroke="#22d3ee" stroke-width="1.5" fill="#22d3ee" opacity="0.55">
+    <!-- линии -->
+    <line x1="40" y1="40" x2="128" y2="84"/>
+    <line x1="216" y1="40" x2="128" y2="84"/>
+    <line x1="40" y1="216" x2="128" y2="172"/>
+    <line x1="216" y1="216" x2="128" y2="172"/>
+    <line x1="40" y1="40" x2="40" y2="216"/>
+    <line x1="216" y1="40" x2="216" y2="216"/>
+    <!-- узлы -->
+    <circle cx="40" cy="40" r="6"/>
+    <circle cx="216" cy="40" r="6"/>
+    <circle cx="40" cy="216" r="6"/>
+    <circle cx="216" cy="216" r="6"/>
+  </g>
+
+  <!-- Корпус USB-флешки -->
+  <g transform="translate(76 70)">
+    <!-- основной корпус -->
+    <rect x="0" y="40" width="104" height="84" rx="10" ry="10" fill="url(#usb)" stroke="#0f172a" stroke-width="2"/>
+    <!-- кольцо для ремешка -->
+    <circle cx="92" cy="114" r="5" fill="#0f172a"/>
+    <!-- USB-коннектор -->
+    <rect x="32" y="0" width="40" height="46" rx="3" ry="3" fill="#cbd5e1" stroke="#0f172a" stroke-width="2"/>
+    <!-- контакты -->
+    <rect x="38" y="8" width="6" height="18" fill="#fbbf24"/>
+    <rect x="48" y="8" width="6" height="18" fill="#fbbf24"/>
+    <rect x="58" y="8" width="6" height="18" fill="#fbbf24"/>
+    <!-- индикатор -->
+    <circle cx="86" cy="98" r="4" fill="#22c55e">
+      <animate attributeName="opacity" values="0.4;1;0.4" dur="1.5s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- Молния, прорезающая флешку (символ скорости / magnet) -->
+  <path d="M 138 56
+           L 96 134
+           L 124 138
+           L 110 200
+           L 168 118
+           L 138 116
+           L 154 56 Z"
+        fill="url(#bolt)" stroke="#7c2d12" stroke-width="2" stroke-linejoin="round"
+        filter="url(#glow)"/>
+</svg>
