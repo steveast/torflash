@@ -833,22 +833,46 @@ class MetaFetcher(QThread):
 
 
 class PosterFetcher(QThread):
-    """Фоновая загрузка картинки постера."""
+    """Фоновая загрузка картинки постера. Поддерживает Referer (для хотлинк-сайтов)."""
 
     loaded = pyqtSignal(str, bytes)  # url, image_bytes
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, referer: str = ""):
         super().__init__()
         self.url = url
+        self.referer = referer
 
     def run(self):
-        try:
-            r = requests.get(self.url, headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            if len(r.content) > 0:
-                self.loaded.emit(self.url, r.content)
-        except (requests.RequestException, OSError) as e:
-            print(f"[poster] fetch failed: {e}", flush=True)
+        headers = dict(HEADERS)
+        if self.referer:
+            headers["Referer"] = self.referer
+        last_err = None
+        for attempt in range(2):
+            try:
+                r = requests.get(self.url, headers=headers, timeout=10)
+                r.raise_for_status()
+                if len(r.content) > 0:
+                    self.loaded.emit(self.url, r.content)
+                return
+            except (requests.RequestException, OSError) as e:
+                last_err = e
+                time.sleep(0.5)
+        msg = str(last_err) if last_err else "unknown"
+        # Не шумим про типичные «мёртвые/враждебные» хостинги:
+        # DNS-фейлы, обрывы соединения, 403/404 от хотлинк-щитов.
+        if any(s in msg for s in (
+            "Name or service not known",
+            "NameResolutionError",
+            "Temporary failure in name resolution",
+            "nodename nor servname",
+            "RemoteDisconnected",
+            "Connection aborted",
+            "Connection reset",
+            "404 Client Error",
+            "403 Client Error",
+        )):
+            return
+        print(f"[poster] fetch failed after retry: {msg}", flush=True)
 
 
 def themed_icon(name: str, style=None, fallback=None) -> QIcon:
@@ -1810,7 +1834,7 @@ class MainWindow(QMainWindow):
             self.description_view.setVisible(True)
         poster_url = data.get("poster_url") or ""
         if poster_url:
-            self._poster_fetcher = PosterFetcher(poster_url)
+            self._poster_fetcher = PosterFetcher(poster_url, referer=url)
             self._poster_fetcher.loaded.connect(self._on_poster_loaded)
             self._poster_fetcher.start()
 

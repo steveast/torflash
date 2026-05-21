@@ -56,10 +56,8 @@ def apply_theme(app, name):
         )
 
     if name == "auto":
-        # Reset to default: let Qt follow the desktop environment.
-        app.setPalette(app.style().standardPalette())
-        # No-op restyle clears any prior style-sheet/palette overrides.
-        app.setStyle(app.style().objectName())
+        # Don't touch anything — let Qt/desktop apply whatever palette is in effect.
+        # (Calling standardPalette() here would override a KDE/Plasma dark palette.)
         return
 
     if name == "light":
