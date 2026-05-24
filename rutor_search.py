@@ -2,9 +2,10 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "steveast/torflash"
 
+import faulthandler
 import json
 import os
 import re
@@ -12,10 +13,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from html import unescape
+import traceback
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 
@@ -34,27 +35,8 @@ EXTRA_TRACKERS = [
     "http://retracker.local/announce",
 ]
 
-# Категории rutor.info: id → название.
-# URL поиска: /search/0/<cat>/000/0/<query>; <cat>=0 — все.
-RUTOR_CATEGORIES = [
-    (0, "Все"),
-    (1, "Зарубежные фильмы"),
-    (5, "Наше кино"),
-    (4, "Зарубежные сериалы"),
-    (16, "Наши сериалы"),
-    (7, "Мультфильмы"),
-    (8, "Игры"),
-    (9, "Аниме"),
-    (10, "Музыка"),
-    (11, "Книги"),
-    (12, "Спорт и здоровье"),
-    (13, "Юмор"),
-    (14, "Документальные"),
-    (15, "Софт"),
-    (17, "Зарубежные мультфильмы"),
-]
 SEARCH_HISTORY_MAX = 30
-from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QGuiApplication, QIcon
 from PyQt5.QtWidgets import (
     QAction,
@@ -90,11 +72,6 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-MIRRORS = [
-    "https://rutor.info",
-    "https://rutor.is",
-    "http://rutor.org",
-]
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -102,51 +79,8 @@ HEADERS = {
     ),
 }
 
-ROW_RE = re.compile(r"<tr[^>]*class=['\"]?(?:gai|tum)['\"]?[^>]*>(.*?)</tr>", re.S)
-CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
-MAGNET_RE = re.compile(r'href="(magnet:\?[^"]+)"')
-PAGE_RE = re.compile(r'href="(/torrent/\d+[^"]*)"')
-TITLE_RE = re.compile(r'<a href="/torrent/\d+[^"]*">(.*?)</a>', re.S)
-SEED_RE = re.compile(r'<span class="green">.*?(\d+)\s*</span>', re.S)
-LEECH_RE = re.compile(r'<span class="red">[^<\d]*(\d+)\s*</span>', re.S)
-DOWNLOAD_RE = re.compile(r'href="(?P<u>(?://|https?://)d\.rutor\.[^"]+/download/\d+[^"]*)"')
-TAG_RE = re.compile(r"<[^>]+>")
-
-
-def strip_tags(html: str) -> str:
-    return unescape(TAG_RE.sub("", html).replace("\xa0", " ")).strip()
-
-
-def parse(html: str, base: str) -> list[dict]:
-    results = []
-    for row in ROW_RE.findall(html):
-        cells = CELL_RE.findall(row)
-        if len(cells) < 3:
-            continue
-        magnet_m = MAGNET_RE.search(row)
-        title_m = TITLE_RE.search(row)
-        page_m = PAGE_RE.search(row)
-        if not (magnet_m and title_m):
-            continue
-        seed_m = SEED_RE.search(cells[-1])
-        leech_m = LEECH_RE.search(cells[-1])
-        dl_m = DOWNLOAD_RE.search(row)
-        dl_url = ""
-        if dl_m:
-            dl_url = dl_m.group("u")
-            if dl_url.startswith("//"):
-                dl_url = "https:" + dl_url
-        results.append({
-            "date": strip_tags(cells[0]),
-            "title": strip_tags(title_m.group(1)),
-            "size": strip_tags(cells[-2]),
-            "seeds": seed_m.group(1) if seed_m else "0",
-            "leech": leech_m.group(1) if leech_m else "0",
-            "magnet": magnet_m.group(1),
-            "torrent_url": dl_url,
-            "page": base + page_m.group(1) if page_m else "",
-        })
-    return results
+from providers import ALL_PROVIDERS, get_provider
+from providers.rutor import CATEGORIES as RUTOR_CATEGORIES
 
 
 # FAT32 не поддерживает файлы >= 4 GiB. Берём запас.
@@ -207,6 +141,18 @@ def fmt_time(seconds) -> str:
     return f"{m}:{sec:02d}"
 
 
+def _result_id(r: dict) -> str:
+    """Стабильный идентификатор результата поиска / элемента очереди загрузки.
+
+    Magnet — самый надёжный (есть info_hash), но у NNM-провайдера magnet пустой
+    до момента скачивания .torrent. Фолбэк — провайдер + страница торрента."""
+    if not r:
+        return ""
+    if r.get("magnet"):
+        return r["magnet"]
+    return f'{r.get("provider","")}::{r.get("page","") or r.get("torrent_url","")}'
+
+
 def detect_flash_mount() -> str | None:
     base = Path(f"/run/media/{os.getlogin()}")
     if not base.exists():
@@ -215,6 +161,47 @@ def detect_flash_mount() -> str | None:
         if child.is_dir() and os.access(child, os.W_OK):
             return str(child)
     return None
+
+
+# Расширения файлов, которые показываем как «фильмы» на флешке.
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm", ".ts", ".m2ts",
+              ".mpg", ".mpeg", ".wmv", ".flv", ".3gp", ".vob"}
+
+# Суффиксы частей, которые ставит CopyWorker: -001 (mkvmerge), .part001 (raw split),
+# .1/.2 (легаси). Группируем по stem без этого суффикса + расширение.
+PART_SUFFIX_RE = re.compile(r"(-\d{3}|\.part\d{3}|\.\d{1,2})$")
+
+
+def _strip_part_suffix(stem: str) -> str:
+    return PART_SUFFIX_RE.sub("", stem)
+
+
+def group_movie_parts(files: list[tuple[Path, int, float]]) -> list[dict]:
+    """Группирует части фильма в один логический фильм.
+
+    Вход: список (path, size, mtime). Выход: список словарей с title, size,
+    count, mtime, paths. Группа из 1 файла = одиночный фильм (исходное имя)."""
+    groups: dict[tuple[str, str], list[tuple[Path, int, float]]] = {}
+    for path, size, mtime in files:
+        key = (_strip_part_suffix(path.stem), path.suffix.lower())
+        groups.setdefault(key, []).append((path, size, mtime))
+    result = []
+    for (base, ext), items in groups.items():
+        items.sort(key=lambda x: x[0].name)
+        # Группа из 1 файла без суффикса — оригинальное имя; иначе — base
+        if len(items) == 1 and items[0][0].stem == base:
+            title = items[0][0].name
+        else:
+            title = base + ext
+        result.append({
+            "title": title,
+            "size": sum(s for _, s, _ in items),
+            "count": len(items),
+            "mtime": max(m for _, _, m in items),
+            "paths": [p for p, _, _ in items],
+        })
+    result.sort(key=lambda g: g["title"].lower())
+    return result
 
 
 class SeedSession:
@@ -543,6 +530,7 @@ class DownloadWorker(QThread):
                 self.seed._save_library()
             self.done.emit(self.save_dir, rel_paths, self.info_hash)
         except Exception as e:
+            print(f"[DL] FAILED save_dir={self.save_dir} hash={self.info_hash[:8] if self.info_hash else '-'}\n{traceback.format_exc()}", flush=True)
             self.failed.emit(f"Ошибка: {e}")
 
 
@@ -598,7 +586,11 @@ class CopyWorker(QThread):
                     return
             self.done.emit(report)
         except OSError as e:
+            print(f"[copy] FAILED dst={self.dst_dir}\n{traceback.format_exc()}", flush=True)
             self.failed.emit(f"Ошибка ввода-вывода: {e}")
+        except Exception as e:
+            print(f"[copy] CRASH\n{traceback.format_exc()}", flush=True)
+            self.failed.emit(f"Ошибка: {e}")
 
     def _stream_copy(self, src: Path, dst: Path, copied: int, total: int, label: str) -> int:
         buf_size = 4 * 1024 * 1024
@@ -781,30 +773,26 @@ class UpdateDownloader(QThread):
 
 
 class SearchWorker(QThread):
-    done = pyqtSignal(list, str)
-    failed = pyqtSignal(str)
+    """Один воркер на один провайдер. MainWindow запускает по одному на каждый
+    включённый источник и мерджит результаты по мере прихода."""
 
-    def __init__(self, query: str, category: int = 0):
+    done = pyqtSignal(str, list)      # provider_name, results
+    failed = pyqtSignal(str, str)     # provider_name, error_message
+
+    def __init__(self, provider, query: str, category: int = 0):
         super().__init__()
+        self.provider = provider
         self.query = query
         self.category = category
 
     def run(self):
-        last_err = ""
-        for base in MIRRORS:
-            if self.category:
-                url = f"{base}/search/0/{self.category}/000/0/{quote(self.query)}"
-            else:
-                url = f"{base}/search/{quote(self.query)}"
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=10)
-                r.raise_for_status()
-                results = parse(r.text, base)
-                self.done.emit(results, base)
-                return
-            except requests.RequestException as e:
-                last_err = f"{base}: {e}"
-        self.failed.emit(last_err or "Все зеркала недоступны")
+        try:
+            results = self.provider.search(self.query, self.category)
+            self.done.emit(self.provider.name, results)
+        except requests.RequestException as e:
+            self.failed.emit(self.provider.name, str(e))
+        except Exception as e:
+            self.failed.emit(self.provider.name, f"{type(e).__name__}: {e}")
 
 
 MAGNET_HASH_RE = re.compile(r"btih:([a-f0-9]+)", re.I)
@@ -1003,7 +991,9 @@ class MainWindow(QMainWindow):
 
         # состояние
         self.results: list[dict] = []
-        self.search_worker: SearchWorker | None = None
+        self.search_workers: list[SearchWorker] = []
+        self._search_in_flight: int = 0
+        self._search_errors: list[str] = []
         self.dl_worker: DownloadWorker | None = None
         self.copy_worker: CopyWorker | None = None
         self.dl_result: dict | None = None
@@ -1102,6 +1092,26 @@ class MainWindow(QMainWindow):
         self.search_btn.clicked.connect(self.start_search)
         search_row.addWidget(self.search_btn)
         v.addLayout(search_row)
+
+        # Чекбоксы провайдеров — какие источники опрашиваем
+        prov_row = QHBoxLayout()
+        prov_row.addWidget(QLabel("Источники:"))
+        enabled_names = set(
+            self.settings.value(
+                "enabled_providers",
+                [p.name for p in ALL_PROVIDERS],
+                type=list,
+            ) or [p.name for p in ALL_PROVIDERS]
+        )
+        self.provider_checks: dict[str, QCheckBox] = {}
+        for p in ALL_PROVIDERS:
+            cb = QCheckBox(p.display_name)
+            cb.setChecked(p.name in enabled_names)
+            cb.toggled.connect(self._save_enabled_providers)
+            prov_row.addWidget(cb)
+            self.provider_checks[p.name] = cb
+        prov_row.addStretch()
+        v.addLayout(prov_row)
 
         # Папка назначения (только если включена флешка) + опции
         dst_row = QHBoxLayout()
@@ -1242,21 +1252,58 @@ class MainWindow(QMainWindow):
         self.flash_eject_btn.clicked.connect(self.eject_flash)
         actions.addWidget(self.flash_eject_btn)
         actions.addStretch()
+
+        self.flash_delete_btn = QPushButton("Удалить выбранное")
+        self.flash_delete_btn.setIcon(
+            themed_icon("edit-delete", self.style(), QStyle.SP_TrashIcon)
+        )
+        self.flash_delete_btn.setEnabled(False)
+        self.flash_delete_btn.clicked.connect(self._flash_delete_selected)
+        actions.addWidget(self.flash_delete_btn)
+
+        self.flash_delete_all_btn = QPushButton("Удалить все фильмы")
+        self.flash_delete_all_btn.setIcon(
+            themed_icon("edit-clear-all", self.style(), QStyle.SP_DialogResetButton)
+        )
+        self.flash_delete_all_btn.clicked.connect(self._flash_delete_all)
+        actions.addWidget(self.flash_delete_all_btn)
+
+        self.flash_format_btn = QPushButton("Отформатировать")
+        self.flash_format_btn.setIcon(
+            themed_icon("drive-harddisk", self.style(), QStyle.SP_DriveHDIcon)
+        )
+        self.flash_format_btn.clicked.connect(self._flash_format)
+        actions.addWidget(self.flash_format_btn)
+
         v.addLayout(actions)
 
-        self.flash_files_table = QTableWidget(0, 3)
-        self.flash_files_table.setHorizontalHeaderLabels(["Файл", "Размер", "Изменён"])
+        self.flash_files_table = QTableWidget(0, 4)
+        self.flash_files_table.setHorizontalHeaderLabels(
+            ["Фильм", "Частей", "Размер", "Изменён"]
+        )
         self.flash_files_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.flash_files_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.flash_files_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.flash_files_table.setAlternatingRowColors(True)
         self.flash_files_table.verticalHeader().setVisible(False)
         fh = self.flash_files_table.horizontalHeader()
         fh.setSectionResizeMode(0, QHeaderView.Stretch)
         fh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         fh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        fh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.flash_files_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.flash_files_table.customContextMenuRequested.connect(self._flash_file_menu)
+        self.flash_files_table.itemSelectionChanged.connect(
+            self._update_flash_buttons_state
+        )
         v.addWidget(self.flash_files_table, 1)
+
+        # Состояние подтверждения для опасных действий (кнопка → arm-таймер)
+        self._flash_armed_btn: QPushButton | None = None
+        self._flash_arm_timer = QTimer(self)
+        self._flash_arm_timer.setSingleShot(True)
+        self._flash_arm_timer.setInterval(5000)
+        self._flash_arm_timer.timeout.connect(self._disarm_flash_btn)
 
         return wrap
 
@@ -1301,27 +1348,38 @@ class MainWindow(QMainWindow):
         target = Path(mount) / "Movies"
         if not target.exists():
             target = Path(mount)
-        rows = []
+        files: list[tuple[Path, int, float]] = []
         try:
-            for p in sorted(target.rglob("*")):
-                if p.is_file():
-                    try:
-                        st = p.stat()
-                        rows.append((p.relative_to(mount), st.st_size, st.st_mtime))
-                    except OSError:
-                        continue
+            for p in target.rglob("*"):
+                # Только видеофайлы, скрытые пропускаем (Android thumbnails и т.п.)
+                if not p.is_file() or p.name.startswith(".") or p.suffix.lower() not in VIDEO_EXTS:
+                    continue
+                try:
+                    st = p.stat()
+                    files.append((p, st.st_size, st.st_mtime))
+                except OSError:
+                    continue
         except OSError as e:
             self.flash_summary.setText(f"Ошибка чтения: {e}")
             return
-        self.flash_files_table.setRowCount(len(rows))
-        for i, (rel, size, mtime) in enumerate(rows):
-            it_name = QTableWidgetItem(str(rel))
-            it_size = QTableWidgetItem(human_bytes(size))
+        groups = group_movie_parts(files)
+        self.flash_files_table.setRowCount(len(groups))
+        for i, g in enumerate(groups):
+            it_name = QTableWidgetItem(g["title"])
+            # Сохраняем список путей в UserRole — нужно для удаления группы целиком
+            it_name.setData(Qt.UserRole, [str(p) for p in g["paths"]])
+            count = g["count"]
+            it_count = QTableWidgetItem(str(count) if count > 1 else "")
+            it_count.setTextAlignment(Qt.AlignCenter)
+            it_size = QTableWidgetItem(human_bytes(g["size"]))
             it_size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            it_mtime = QTableWidgetItem(time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)))
-            for col, it in enumerate((it_name, it_size, it_mtime)):
+            it_mtime = QTableWidgetItem(
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(g["mtime"]))
+            )
+            for col, it in enumerate((it_name, it_count, it_size, it_mtime)):
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
                 self.flash_files_table.setItem(i, col, it)
+        self._update_flash_buttons_state()
 
     def _open_flash_folder(self):
         mount = detect_flash_mount()
@@ -1339,27 +1397,228 @@ class MainWindow(QMainWindow):
         name_item = self.flash_files_table.item(row, 0)
         if not name_item:
             return
-        mount = detect_flash_mount()
-        if not mount:
+        paths = name_item.data(Qt.UserRole) or []
+        if not paths:
             return
-        full = Path(mount) / name_item.text()
         menu = QMenu(self)
+        # Открыть — для первой части (для одиночных это и есть сам файл)
         act_open = menu.addAction("Открыть")
-        act_open.triggered.connect(
-            lambda: subprocess.Popen(["xdg-open", str(full)])
-        )
+        first = paths[0]
+        act_open.triggered.connect(lambda: subprocess.Popen(["xdg-open", first]))
         menu.addSeparator()
-        act_del = menu.addAction("Удалить с флешки")
-        act_del.triggered.connect(lambda: self._flash_delete_file(full))
+        label = "Удалить с флешки" if len(paths) == 1 else f"Удалить с флешки ({len(paths)} частей)"
+        act_del = menu.addAction(label)
+        act_del.triggered.connect(lambda: self._flash_delete_paths(paths))
         menu.exec_(self.flash_files_table.viewport().mapToGlobal(pos))
 
-    def _flash_delete_file(self, path: Path):
+    def _flash_delete_paths(self, paths: list[str]) -> tuple[int, list[str]]:
+        deleted = 0
+        errors = []
+        for sp in paths:
+            try:
+                Path(sp).unlink(missing_ok=True)
+                deleted += 1
+            except OSError as e:
+                errors.append(f"{Path(sp).name}: {e}")
+        return deleted, errors
+
+    def _selected_flash_paths(self) -> list[str]:
+        paths: list[str] = []
+        rows = sorted({i.row() for i in self.flash_files_table.selectedItems()})
+        for row in rows:
+            name_item = self.flash_files_table.item(row, 0)
+            if name_item:
+                paths.extend(name_item.data(Qt.UserRole) or [])
+        return paths
+
+    def _update_flash_buttons_state(self):
+        has_sel = bool(self.flash_files_table.selectionModel()
+                       and self.flash_files_table.selectionModel().hasSelection())
+        self.flash_delete_btn.setEnabled(has_sel)
+        has_rows = self.flash_files_table.rowCount() > 0
+        self.flash_delete_all_btn.setEnabled(has_rows)
+        # Если выбор пропал — снимаем взвод с кнопки «Удалить выбранное»
+        if not has_sel and self._flash_armed_btn is self.flash_delete_btn:
+            self._disarm_flash_btn()
+
+    # ---------- arm-to-confirm ----------
+    def _arm_flash_btn(self, btn: QPushButton, confirm_text: str, hint: str) -> bool:
+        """Двухкликовое подтверждение. Возврат True — пора выполнять действие."""
+        if self._flash_armed_btn is btn:
+            self._disarm_flash_btn()
+            return True
+        self._disarm_flash_btn()
+        self._flash_armed_btn = btn
+        btn.setProperty("_orig_text", btn.text())
+        btn.setText(confirm_text)
+        btn.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
+        self._show_banner(hint, kind="warn")
+        self._flash_arm_timer.start()
+        return False
+
+    def _disarm_flash_btn(self):
+        self._flash_arm_timer.stop()
+        btn = self._flash_armed_btn
+        if btn is not None:
+            orig = btn.property("_orig_text")
+            if orig:
+                btn.setText(orig)
+            btn.setStyleSheet("")
+        self._flash_armed_btn = None
+        self._hide_banner()
+
+    # ---------- delete actions ----------
+    def _flash_delete_selected(self):
+        paths = self._selected_flash_paths()
+        if not paths:
+            return
+        rows = len({i.row() for i in self.flash_files_table.selectedItems()})
+        total = sum(Path(p).stat().st_size for p in paths if Path(p).exists())
+        if not self._arm_flash_btn(
+            self.flash_delete_btn,
+            f"Подтвердите удаление ({rows})",
+            f"Будет удалено фильмов: {rows} ({len(paths)} файлов, {human_bytes(total)}). "
+            "Нажмите ещё раз для подтверждения.",
+        ):
+            return
+        deleted, errors = self._flash_delete_paths(paths)
+        self._refresh_flash_tab()
+        if errors:
+            self._show_banner(f"Удалено {deleted}, ошибок {len(errors)}: " + "; ".join(errors[:3]))
+        else:
+            self.statusBar().showMessage(f"Удалено файлов: {deleted}", 4000)
+
+    def _flash_delete_all(self):
+        if self.dl_result is not None:
+            self._show_banner("Идёт загрузка — дождитесь завершения")
+            return
+        if self.copy_worker and self.copy_worker.isRunning():
+            self._show_banner("Идёт копирование — дождитесь завершения")
+            return
+        mount = detect_flash_mount()
+        if not mount:
+            self._show_banner("Флешка не смонтирована")
+            return
+        movies = Path(mount) / "Movies"
+        if not movies.exists():
+            self.statusBar().showMessage("Папка Movies не найдена — нечего удалять", 4000)
+            return
+        all_paths = [
+            str(p) for p in movies.rglob("*")
+            if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in VIDEO_EXTS
+        ]
+        if not all_paths:
+            self.statusBar().showMessage("Movies пуста", 3000)
+            return
+        total = sum(Path(p).stat().st_size for p in all_paths)
+        if not self._arm_flash_btn(
+            self.flash_delete_all_btn,
+            "Подтвердите: удалить ВСЁ",
+            f"Будут удалены ВСЕ фильмы в {movies} "
+            f"({len(all_paths)} файлов, {human_bytes(total)}). "
+            "Нажмите ещё раз для подтверждения.",
+        ):
+            return
+        deleted, errors = self._flash_delete_paths(all_paths)
+        # Подчистим пустые подпапки внутри Movies
+        for sub in sorted(movies.rglob("*"), reverse=True):
+            if sub.is_dir():
+                try:
+                    sub.rmdir()
+                except OSError:
+                    pass
+        self._refresh_flash_tab()
+        if errors:
+            self._show_banner(f"Удалено {deleted}, ошибок {len(errors)}: " + "; ".join(errors[:3]))
+        else:
+            self.statusBar().showMessage(f"Удалено все фильмы ({deleted} файлов)", 5000)
+
+    def _flash_format(self):
+        if self.dl_result is not None:
+            self._show_banner("Идёт загрузка — дождитесь завершения перед форматированием")
+            return
+        if self.copy_worker and self.copy_worker.isRunning():
+            self._show_banner("Идёт копирование — дождитесь завершения перед форматированием")
+            return
+        mount = detect_flash_mount()
+        if not mount:
+            self._show_banner("Флешка не смонтирована")
+            return
         try:
-            path.unlink(missing_ok=True)
+            src = subprocess.run(
+                ["findmnt", "-no", "SOURCE", mount],
+                capture_output=True, text=True, check=True, timeout=5,
+            ).stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            self._show_banner(f"findmnt: {e}")
+            return
+        if not src:
+            self._show_banner(f"Не удалось определить устройство для {mount}")
+            return
+        # Запомним текущую метку, чтобы сохранить
+        label = Path(mount).name or "KINGSTON"
+        try:
+            cur_label = subprocess.run(
+                ["lsblk", "-no", "LABEL", src],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip()
+            if cur_label:
+                label = cur_label
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+        usage = shutil.disk_usage(mount)
+        if not self._arm_flash_btn(
+            self.flash_format_btn,
+            f"Подтвердите: форматировать {src}",
+            f"Будут стёрты ВСЕ данные на {src} ({Path(mount).name}, "
+            f"{human_bytes(usage.total)}). После форматирования: FAT32, метка «{label}». "
+            "Нажмите ещё раз для подтверждения.",
+        ):
+            return
+        try:
+            subprocess.run(["sync"], check=False, timeout=10)
+            unmount = subprocess.run(
+                ["udisksctl", "unmount", "-b", src],
+                capture_output=True, text=True, timeout=15,
+            )
+            if unmount.returncode != 0:
+                self._show_banner(
+                    "Не удалось размонтировать: "
+                    + (unmount.stderr or unmount.stdout).strip()
+                )
+                return
+            fmt = subprocess.run(
+                ["udisksctl", "format", "-b", src,
+                 "--type", "vfat", "--label", label, "--no-user-interaction"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if fmt.returncode != 0:
+                self._show_banner(
+                    "Ошибка форматирования: " + (fmt.stderr or fmt.stdout).strip()
+                )
+                return
+            # Перемонтируем
+            mnt = subprocess.run(
+                ["udisksctl", "mount", "-b", src],
+                capture_output=True, text=True, timeout=15,
+            )
+            if mnt.returncode != 0:
+                self._show_banner(
+                    "Отформатировано, но не удалось примонтировать: "
+                    + (mnt.stderr or mnt.stdout).strip(),
+                    kind="info",
+                )
+            else:
+                self._show_banner(
+                    f"Флешка отформатирована (FAT32, метка «{label}»)",
+                    kind="info",
+                )
             self._refresh_flash_tab()
-            self.statusBar().showMessage(f"Удалено: {path.name}", 3000)
-        except OSError as e:
-            self.statusBar().showMessage(f"Ошибка удаления: {e}", 4000)
+            self._refresh_flash_info()
+        except FileNotFoundError as e:
+            self._show_banner(f"Утилита не найдена: {e}")
+        except subprocess.SubprocessError as e:
+            self._show_banner(f"Ошибка: {e}")
 
     def _build_library_detail(self) -> QWidget:
         outer = QScrollArea()
@@ -1463,8 +1722,10 @@ class MainWindow(QMainWindow):
         return outer
 
     def _build_list(self) -> QWidget:
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Дата", "Название", "Размер", "S", "L"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Дата", "Источник", "Название", "Размер", "S", "L"]
+        )
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1472,8 +1733,8 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
-        for i in (0, 2, 3, 4):
+        h.setSectionResizeMode(2, QHeaderView.Stretch)  # Название
+        for i in (0, 1, 3, 4, 5):
             h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.doubleClicked.connect(self.download_to_flash)
@@ -1759,6 +2020,9 @@ class MainWindow(QMainWindow):
             QLabel#banner[kind="info"] {
                 background: #2980b9;
             }
+            QLabel#banner[kind="warn"] {
+                background: #d35400;
+            }
             QLabel#flashInfo {
                 padding: 6px 10px;
                 border-radius: 4px;
@@ -1789,13 +2053,12 @@ class MainWindow(QMainWindow):
 
     def current_result(self) -> dict | None:
         row = self.table.currentRow()
-        if row < 0 or row >= len(self.results):
+        if row < 0:
             return None
-        title = self.table.item(row, 1).text()
-        for r in self.results:
-            if r["title"] == title:
-                return r
-        return None
+        it = self.table.item(row, 0)
+        if it is None:
+            return None
+        return it.data(Qt.UserRole)
 
     def _on_selection_changed(self):
         r = self.current_result()
@@ -1850,7 +2113,7 @@ class MainWindow(QMainWindow):
         self.poster_label.setPixmap(pix)
         self.poster_label.setVisible(True)
         # показываем прогресс, только если скачивается ИМЕННО этот элемент
-        if self.dl_result and self.dl_result["magnet"] == r["magnet"]:
+        if self.dl_result and _result_id(self.dl_result) == _result_id(r):
             self._refresh_progress_widget()
             self.progress_box.setVisible(True)
             self.flash_btn.setEnabled(False)
@@ -1875,22 +2138,44 @@ class MainWindow(QMainWindow):
 
     # ---------- search ----------
 
+    def _save_enabled_providers(self):
+        enabled = [n for n, cb in self.provider_checks.items() if cb.isChecked()]
+        self.settings.setValue("enabled_providers", enabled)
+
+    def _enabled_providers(self) -> list:
+        return [p for p in ALL_PROVIDERS if self.provider_checks[p.name].isChecked()]
+
     def start_search(self):
         query = self.input.text().strip()
         if not query:
             return
-        if self.search_worker and self.search_worker.isRunning():
+        if self._search_in_flight > 0:
+            return
+        providers = self._enabled_providers()
+        if not providers:
+            self._show_banner("Не выбран ни один источник")
             return
         category = self.category_combo.currentData() or 0
         self.settings.setValue("last_category", int(category))
         self._push_history(query)
         self.search_btn.setEnabled(False)
-        self.statusBar().showMessage("Поиск…")
+        self.statusBar().showMessage(
+            f"Поиск в {len(providers)} источниках…"
+        )
         self._hide_banner()
-        self.search_worker = SearchWorker(query, category=int(category))
-        self.search_worker.done.connect(self._on_search_done)
-        self.search_worker.failed.connect(self._on_search_failed)
-        self.search_worker.start()
+        # Очищаем таблицу и буфер результатов
+        self.results = []
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        self._search_errors = []
+        self.search_workers = []
+        self._search_in_flight = len(providers)
+        for p in providers:
+            w = SearchWorker(p, query, category=int(category))
+            w.done.connect(self._on_search_done)
+            w.failed.connect(self._on_search_failed)
+            self.search_workers.append(w)
+            w.start()
 
     def _push_history(self, query: str):
         q = query.strip()
@@ -1911,26 +2196,61 @@ class MainWindow(QMainWindow):
             self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
             self.input.setCompleter(self.search_completer)
 
-    def _on_search_done(self, results: list, mirror: str):
-        self.search_btn.setEnabled(True)
-        self.results = results
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(results))
-        for i, r in enumerate(results):
-            for j, key in enumerate(("date", "title", "size", "seeds", "leech")):
-                item = QTableWidgetItem(r[key])
+    def _provider_display(self, name: str) -> str:
+        p = get_provider(name)
+        return p.display_name if p else name
+
+    def _on_search_done(self, provider_name: str, results: list):
+        # Дописываем результаты в таблицу. Сортировка делается после
+        # завершения всех воркеров — чтобы пользователь не видел дёрганий.
+        before = len(self.results)
+        self.results.extend(results)
+        self.table.setRowCount(len(self.results))
+        display = self._provider_display(provider_name)
+        for offset, r in enumerate(results):
+            i = before + offset
+            cells = (
+                ("date", r["date"]),
+                ("provider", display),
+                ("title", r["title"]),
+                ("size", r["size"]),
+                ("seeds", r["seeds"]),
+                ("leech", r["leech"]),
+            )
+            for j, (key, text) in enumerate(cells):
+                item = QTableWidgetItem(text)
                 if key in ("seeds", "leech"):
                     item.setTextAlignment(Qt.AlignCenter)
+                if j == 0:
+                    item.setData(Qt.UserRole, r)
                 self.table.setItem(i, j, item)
-        self.table.setSortingEnabled(True)
-        self.statusBar().showMessage(f"Найдено: {len(results)} ({mirror})", 5000)
-        if results:
-            self.table.selectRow(0)
+        self._search_in_flight -= 1
+        if self._search_in_flight <= 0:
+            self._finalize_search()
 
-    def _on_search_failed(self, err: str):
+    def _on_search_failed(self, provider_name: str, err: str):
+        self._search_errors.append(f"{self._provider_display(provider_name)}: {err}")
+        self._search_in_flight -= 1
+        if self._search_in_flight <= 0:
+            self._finalize_search()
+
+    def _finalize_search(self):
         self.search_btn.setEnabled(True)
-        self.statusBar().showMessage("Ошибка поиска", 5000)
-        self._show_banner(f"Поиск не удался: {err}")
+        self.table.setSortingEnabled(True)
+        # По умолчанию сортируем по сидам (по убыванию), чтобы лучшее всплыло
+        self.table.sortItems(4, Qt.DescendingOrder)
+        total = len(self.results)
+        msg = f"Найдено: {total}"
+        if self._search_errors:
+            msg += f" · ошибок: {len(self._search_errors)}"
+        self.statusBar().showMessage(msg, 6000)
+        if self._search_errors and total == 0:
+            self._show_banner("Поиск не удался: " + "; ".join(self._search_errors))
+        elif self._search_errors:
+            # Часть источников упала, часть отдала — мягкое уведомление
+            print(f"[search] partial failures: {self._search_errors}", flush=True)
+        if total:
+            self.table.selectRow(0)
 
     # ---------- destination ----------
 
@@ -2118,15 +2438,17 @@ class MainWindow(QMainWindow):
         if self.dl_result is not None:
             if not hasattr(self, "_dl_queue"):
                 self._dl_queue = []
-            entry = {
-                "magnet": r["magnet"],
-                "torrent_url": r.get("torrent_url", ""),
-                "title": r["title"],
-                "use_flash": self.flash_check.isChecked(),
-            }
-            # Избегаем дубликатов
-            if not any(q["magnet"] == r["magnet"] for q in self._dl_queue):
+            # Сохраняем полный результат + флаг флешки. provider/page нужны
+            # для _result_id, чтобы сравнения с активной загрузкой работали.
+            entry = dict(r)
+            entry["use_flash"] = self.flash_check.isChecked()
+            if not any(_result_id(q) == _result_id(entry) for q in self._dl_queue):
                 self._dl_queue.append(entry)
+                print(
+                    f"[queue] add #{len(self._dl_queue)} id={_result_id(entry)} "
+                    f"title={r['title'][:60]}",
+                    flush=True,
+                )
                 self.statusBar().showMessage(
                     f"В очередь #{len(self._dl_queue)}: {r['title'][:60]}", 4000
                 )
@@ -2161,15 +2483,19 @@ class MainWindow(QMainWindow):
         self.dl_progress = (pct, status)
         # обновляем UI только если просматриваем этот же элемент
         cur = self.current_result()
-        if cur and self.dl_result and cur["magnet"] == self.dl_result["magnet"]:
+        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
             self._refresh_progress_widget()
 
     def _on_dl_failed(self, err: str):
-        self._reset_dl_state()
+        print(f"[dl] failed err={err!r}", flush=True)
+        # Сначала показываем сообщение, потом сбрасываем — иначе сообщение из
+        # _start_download_for («Из очереди…») перетирается этим, и пользователю
+        # кажется, что отмена остановила и следующие задачи в очереди.
         if err == "Отменено":
-            self.statusBar().showMessage("Загрузка отменена", 3000)
-            return
-        self._show_banner(f"Ошибка загрузки: {err}")
+            self.statusBar().showMessage("Загрузка отменена", 2500)
+        else:
+            self._show_banner(f"Ошибка загрузки: {err}")
+        self._reset_dl_state()
 
     def _on_dl_done(self, save_dir: str, rel_paths: list, info_hash: str):
         # Файлы лежат в ~/Storage и торрент остаётся в seed session.
@@ -2198,7 +2524,7 @@ class MainWindow(QMainWindow):
         self.dl_phase = "copy"
         self.dl_progress = (0, "Подготовка…")
         cur = self.current_result()
-        if cur and self.dl_result and cur["magnet"] == self.dl_result["magnet"]:
+        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
             self._refresh_progress_widget()
         self.copy_worker = CopyWorker(save_dir, rel_paths, self.dst_dir, FAT32_MAX_PART)
         self.copy_worker.progress.connect(self._on_copy_progress)
@@ -2209,7 +2535,7 @@ class MainWindow(QMainWindow):
     def _on_copy_progress(self, pct: int, status: str):
         self.dl_progress = (pct, status)
         cur = self.current_result()
-        if cur and self.dl_result and cur["magnet"] == self.dl_result["magnet"]:
+        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
             self._refresh_progress_widget()
 
     def _on_copy_done(self, report: list):
@@ -2226,15 +2552,17 @@ class MainWindow(QMainWindow):
         )
 
     def _on_copy_failed(self, err: str):
-        self._reset_dl_state()
+        print(f"[copy] failed err={err!r}", flush=True)
         if err == "Отменено":
-            self.statusBar().showMessage("Копирование отменено", 3000)
-            return
-        self._show_banner(
-            f"Ошибка копирования: {err}. Файлы скачаны в ~/Storage, раздача идёт."
-        )
+            self.statusBar().showMessage("Копирование отменено", 2500)
+        else:
+            self._show_banner(
+                f"Ошибка копирования: {err}. Файлы скачаны в ~/Storage, раздача идёт."
+            )
+        self._reset_dl_state()
 
     def _reset_dl_state(self):
+        prev_id = _result_id(self.dl_result) if self.dl_result else ""
         self.dl_result = None
         self.dl_worker = None
         self.copy_worker = None
@@ -2242,20 +2570,19 @@ class MainWindow(QMainWindow):
         self.dl_progress = (0, "")
         self.progress_box.setVisible(False)
         self.flash_btn.setEnabled(True)
+        q_len = len(getattr(self, "_dl_queue", []) or [])
+        print(f"[queue] reset prev_id={prev_id} queue_size={q_len}", flush=True)
         # Если есть очередь — стартуем следующий
         if getattr(self, "_dl_queue", None):
             next_item = self._dl_queue.pop(0)
             self.flash_check.blockSignals(True)
             self.flash_check.setChecked(next_item.get("use_flash", False))
             self.flash_check.blockSignals(False)
-            fake = {
-                "magnet": next_item["magnet"],
-                "torrent_url": next_item.get("torrent_url", ""),
-                "title": next_item.get("title", ""),
-            }
-            self._start_download_for(fake)
+            # next_item уже хранит полный результат — пробрасываем как есть.
+            self._start_download_for(dict(next_item))
 
     def _start_download_for(self, r: dict):
+        print(f"[queue] start next id={_result_id(r)} title={r.get('title','')[:60]}", flush=True)
         self._hide_banner()
         self.dl_result = r
         self.dl_phase = "dl"
@@ -2802,18 +3129,95 @@ def setup_icon_theme():
                     return
 
 
-def main():
-    # При запуске бинарника без терминала перенаправляем логи в файл
-    if getattr(sys, "frozen", False):
+class _Tee:
+    """stdout/stderr -> файл + исходный поток (если есть)."""
+    def __init__(self, fp, mirror):
+        self._fp = fp
+        self._mirror = mirror
+    def write(self, data):
         try:
-            LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-            log_path = LIBRARY_DIR / "torflash.log"
-            f = open(log_path, "a", buffering=1)
-            sys.stdout = f
-            sys.stderr = f
-            print(f"\n=== {APP_NAME} v{APP_VERSION} started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
-        except OSError:
+            self._fp.write(data)
+            self._fp.flush()
+        except Exception:
             pass
+        if self._mirror is not None:
+            try:
+                self._mirror.write(data)
+                self._mirror.flush()
+            except Exception:
+                pass
+        return len(data) if isinstance(data, str) else 0
+    def flush(self):
+        try: self._fp.flush()
+        except Exception: pass
+        if self._mirror is not None:
+            try: self._mirror.flush()
+            except Exception: pass
+    def isatty(self):
+        return False
+    def fileno(self):
+        return self._fp.fileno()
+
+
+def _install_logging():
+    """Полное логирование: файл + терминал, traceback необработанных исключений,
+    faulthandler для нативных крашей (libtorrent)."""
+    try:
+        LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = LIBRARY_DIR / "torflash.log"
+        log_fp = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+
+    # Если запущены без терминала (frozen или из .desktop) — mirror None.
+    mirror_out = sys.__stdout__ if (sys.__stdout__ and sys.__stdout__.isatty()) else None
+    mirror_err = sys.__stderr__ if (sys.__stderr__ and sys.__stderr__.isatty()) else None
+    sys.stdout = _Tee(log_fp, mirror_out)
+    sys.stderr = _Tee(log_fp, mirror_err)
+
+    # faulthandler пишет нативные сегфолты (libtorrent и т.п.) в этот же файл.
+    try:
+        faulthandler.enable(file=log_fp, all_threads=True)
+    except Exception as e:
+        print(f"[log] faulthandler enable failed: {e}", flush=True)
+
+    def _excepthook(exc_type, exc, tb):
+        print("[uncaught] " + "".join(traceback.format_exception(exc_type, exc, tb)), flush=True)
+        # Цепляем дефолтный, чтобы Qt тоже увидел.
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _excepthook
+
+    def _thread_excepthook(args):
+        print(
+            f"[uncaught-thread] in {args.thread.name if args.thread else '?'}:\n"
+            + "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)),
+            flush=True,
+        )
+    threading.excepthook = _thread_excepthook
+
+    if hasattr(sys, "unraisablehook"):
+        def _unraisable(unr):
+            print(
+                f"[unraisable] {unr.err_msg or ''} obj={unr.object!r}\n"
+                + "".join(traceback.format_exception(unr.exc_type, unr.exc_value, unr.exc_traceback)),
+                flush=True,
+            )
+        sys.unraisablehook = _unraisable
+
+    print(
+        f"\n=== {APP_NAME} v{APP_VERSION} started at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"(pid={os.getpid()}, frozen={getattr(sys, 'frozen', False)}) ===",
+        flush=True,
+    )
+    try:
+        import libtorrent as _lt
+        print(f"[env] libtorrent {_lt.__version__} python {sys.version.split()[0]}", flush=True)
+    except Exception:
+        pass
+
+
+def main():
+    _install_logging()
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -2833,8 +3237,8 @@ def main():
     def _on_about_to_quit():
         try:
             w.seed.shutdown()
-        except Exception as e:
-            print(f"[main] seed shutdown error: {e}", flush=True)
+        except Exception:
+            print(f"[main] seed shutdown error:\n{traceback.format_exc()}", flush=True)
     app.aboutToQuit.connect(_on_about_to_quit)
 
     start_hidden = (
