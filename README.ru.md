@@ -68,7 +68,7 @@ chmod +x TorFlash
 sudo pacman -S libtorrent-rasterbar python-pyqt5 python-requests
 git clone https://github.com/steveast/torflash.git
 cd torflash
-python3 rutor_search.py
+python3 src/rutor_search.py
 ```
 
 Для других дистрибутивов: `libtorrent-rasterbar` с Python-биндингами обычно идёт под именем `python3-libtorrent` (Debian/Ubuntu) или `python-libtorrent` (rpm).
@@ -78,8 +78,7 @@ python3 rutor_search.py
 ```bash
 python3 -m venv --system-site-packages .build-venv
 .build-venv/bin/pip install pyinstaller
-.build-venv/bin/pyinstaller --onefile --windowed --name TorFlash \
-    --add-data "torflash.svg:." rutor_search.py
+.build-venv/bin/pyinstaller --clean --noconfirm TorFlash.spec
 # Готовый бинарник: dist/TorFlash
 ```
 
@@ -103,7 +102,7 @@ python3 -m venv --system-site-packages .build-venv
 
 ## Архитектура
 
-- `rutor_search.py` — единственный модуль (~1500 строк)
+- `src/rutor_search.py` — основной модуль
 - `SearchWorker` — HTTP-парсинг rutor.info (regex, без BeautifulSoup)
 - `SeedSession` — постоянная `libtorrent.session`, библиотека в `~/.local/share/TorFlash/library.json`, resume data, кэш `.torrent`
 - `DownloadWorker` — добавляет в общую сессию, мониторит прогресс, по завершении оставляет в сидинге

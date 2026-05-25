@@ -68,7 +68,7 @@ You'll need Python 3.11+ and these system packages (Arch):
 sudo pacman -S libtorrent-rasterbar python-pyqt5 python-requests mkvtoolnix-cli
 git clone https://github.com/steveast/torflash.git
 cd torflash
-python3 rutor_search.py
+python3 src/rutor_search.py
 ```
 
 For other distros, `libtorrent-rasterbar` with Python bindings ships as `python3-libtorrent` on Debian/Ubuntu or `python-libtorrent` on rpm-based systems.
@@ -78,13 +78,7 @@ For other distros, `libtorrent-rasterbar` with Python bindings ships as `python3
 ```bash
 python3 -m venv --system-site-packages .build-venv
 .build-venv/bin/pip install pyinstaller
-.build-venv/bin/pyinstaller --onefile --windowed --name TorFlash \
-    --add-data "torflash.svg:." \
-    --add-data "torflash-tray.svg:." \
-    --add-data "torflash-tray-22.png:." \
-    --add-data "torflash-tray-32.png:." \
-    --add-data "torflash-tray-48.png:." \
-    rutor_search.py
+.build-venv/bin/pyinstaller --clean --noconfirm TorFlash.spec
 # Output: dist/TorFlash
 ```
 
@@ -108,7 +102,7 @@ Uncheck "Mirror to flash" and everything just lands in `~/Storage`.
 
 ## Architecture
 
-- `rutor_search.py` — single module (~1700 lines)
+- `src/rutor_search.py` — main module
 - `SearchWorker` — rutor.info HTML scraping with regex (no BeautifulSoup)
 - `SeedSession` — persistent `libtorrent.session`, library in `~/.local/share/TorFlash/library.json`, resume data, `.torrent` cache
 - `DownloadWorker` — adds torrents to the shared session, watches progress, leaves them seeding when done

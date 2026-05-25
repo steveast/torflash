@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 GITHUB_REPO = "steveast/torflash"
 
 import faulthandler
@@ -20,6 +20,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
+
+def _assets_dir() -> Path:
+    """Папка с иконками и ресурсами. PyInstaller кладёт --add-data в _MEIPASS,
+    при запуске из исходников — ../assets относительно src/."""
+    mei = getattr(sys, "_MEIPASS", None)
+    if mei:
+        return Path(mei)
+    return Path(__file__).resolve().parent.parent / "assets"
+
+ASSETS_DIR = _assets_dir()
 
 LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
 TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"
@@ -407,6 +417,10 @@ class SeedSession:
             "is_seeding": s.is_seeding,
             "has_metadata": s.has_metadata,
             "save_path": meta.get("save_path", str(STORAGE_DEFAULT)),
+            "added_at": meta.get("added_at", 0),
+            "completed_at": meta.get("completed_at", 0),
+            "active_time": getattr(s, "active_time", 0),
+            "seeding_time": getattr(s, "seeding_time", 0),
         }
 
     def all_statuses(self) -> list:
@@ -1025,7 +1039,7 @@ class SettingsDialog(QDialog):
         if enabled:
             AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
             exe = sys.executable if getattr(sys, "frozen", False) else f"/usr/bin/python3 {Path(__file__).resolve()}"
-            icon = Path(__file__).resolve().parent / "torflash.svg"
+            icon = ASSETS_DIR / "torflash.svg"
             content = (
                 "[Desktop Entry]\n"
                 "Type=Application\n"
@@ -1045,9 +1059,9 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} — торренты rutor → флешка")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — торренты rutor → флешка")
         self.resize(1300, 760)
-        icon_path = Path(__file__).parent / "torflash.svg"
+        icon_path = ASSETS_DIR / "torflash.svg"
         if icon_path.exists():
             from PyQt5.QtGui import QIcon
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -1745,6 +1759,7 @@ class MainWindow(QMainWindow):
         self.lib_path_val.setWordWrap(True)
         self.lib_path_val.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lib_ratio_val = QLabel()
+        self.lib_time_val = QLabel()
         self.lib_pending_val = QLabel()
         self.lib_media_val = QLabel()
         self.lib_media_val.setStyleSheet("color: #888;")
@@ -1753,6 +1768,7 @@ class MainWindow(QMainWindow):
         meta.addRow("Размер:", self.lib_size_val)
         meta.addRow("Скачано:", self.lib_downloaded_val)
         meta.addRow("Скорости:", self.lib_rates_val)
+        meta.addRow("Время:", self.lib_time_val)
         meta.addRow("Пиры:", self.lib_peers_val)
         meta.addRow("Папка:", self.lib_path_val)
         meta.addRow("Отдано:", self.lib_ratio_val)
@@ -1976,14 +1992,11 @@ class MainWindow(QMainWindow):
             self.tray = None
             return
         # Для трея — отдельная упрощённая иконка (без анимаций и мелких деталей)
-        base = Path(__file__).resolve().parent
-        if not base.exists():
-            base = Path(getattr(sys, "_MEIPASS", "."))
-        tray_path = base / "torflash-tray.svg"
+        tray_path = ASSETS_DIR / "torflash-tray.svg"
         icon = QIcon(str(tray_path)) if tray_path.exists() else self.windowIcon()
         # Добавим PNG-варианты разных размеров — KDE предпочитает их при выборе
         for size in (22, 32, 48):
-            png = base / f"torflash-tray-{size}.png"
+            png = ASSETS_DIR / f"torflash-tray-{size}.png"
             if png.exists():
                 icon.addFile(str(png))
 
@@ -2965,6 +2978,20 @@ class MainWindow(QMainWindow):
         self.lib_rates_val.setText(
             f"↓ {human_bytes(s['download_rate'])}/s · ↑ {human_bytes(s['upload_rate'])}/s"
         )
+        # Время: прошло с добавления + ETA
+        elapsed_parts = []
+        if s["added_at"]:
+            elapsed_s = time.time() - s["added_at"]
+            elapsed_parts.append(f"прошло {fmt_time(elapsed_s)}")
+        if s["completed_at"] and s["added_at"]:
+            dl_time = s["completed_at"] - s["added_at"]
+            elapsed_parts.append(f"скачано за {fmt_time(dl_time)}")
+        elif not s["is_seeding"] and s["progress"] < 1.0 and s["download_rate"] > 1024 and s["size"]:
+            remaining = (1.0 - s["progress"]) * s["size"] / s["download_rate"]
+            elapsed_parts.append(f"осталось ~{fmt_time(remaining)}")
+        if s["seeding_time"] and s["is_seeding"]:
+            elapsed_parts.append(f"раздача {fmt_time(s['seeding_time'])}")
+        self.lib_time_val.setText(" · ".join(elapsed_parts) if elapsed_parts else "—")
         self.lib_peers_val.setText(f"{s['num_peers']} (сидов: {s['num_seeds']})")
         self.lib_path_val.setText(s["save_path"])
         total_up = getattr(st, "total_payload_upload", 0) or 0
@@ -3216,7 +3243,7 @@ class MainWindow(QMainWindow):
     def _notify(self, title: str, body: str):
         """Send desktop notification via notify-send."""
         try:
-            icon_path = str(Path(__file__).resolve().parent / "torflash.svg")
+            icon_path = str(ASSETS_DIR / "torflash.svg")
             cmd = ["notify-send", "-a", APP_NAME, "-i", icon_path, title, body]
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (FileNotFoundError, OSError):
@@ -3426,11 +3453,7 @@ def main():
     app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)  # окно скрывается в трей — не выходим
     setup_icon_theme()
-    icon_path = Path(__file__).resolve().parent / "torflash.svg"
-    if not icon_path.exists():
-        mei = getattr(sys, "_MEIPASS", None)
-        if mei:
-            icon_path = Path(mei) / "torflash.svg"
+    icon_path = ASSETS_DIR / "torflash.svg"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
