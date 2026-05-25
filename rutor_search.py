@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
@@ -37,7 +38,7 @@ EXTRA_TRACKERS = [
 
 SEARCH_HISTORY_MAX = 30
 from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QGuiApplication, QIcon
+from PyQt5.QtGui import QFont, QGuiApplication, QIcon, QKeySequence
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -58,6 +59,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QShortcut,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -204,6 +206,9 @@ def group_movie_parts(files: list[tuple[Path, int, float]]) -> list[dict]:
     return result
 
 
+STATS_FILE = LIBRARY_DIR / "stats.json"
+
+
 class SeedSession:
     """Постоянная libtorrent-сессия. Хранит библиотеку, переустанавливает торренты на старте."""
 
@@ -214,6 +219,9 @@ class SeedSession:
         TORRENTS_CACHE_DIR.mkdir(exist_ok=True)
         RESUME_DIR.mkdir(exist_ok=True)
         STORAGE_DEFAULT.mkdir(parents=True, exist_ok=True)
+        self.stats = self._load_stats()
+        self._prev_session_dl = 0
+        self._prev_session_ul = 0
         self.ses = lt.session({
             "listen_interfaces": "0.0.0.0:6881",
             "alert_mask": (
@@ -435,7 +443,42 @@ class SeedSession:
         except (AttributeError, RuntimeError) as e:
             print(f"[seed] apply_rate_limits failed: {e}", flush=True)
 
+    def _load_stats(self) -> dict:
+        if STATS_FILE.exists():
+            try:
+                return json.loads(STATS_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                return {"total_downloaded": 0, "total_uploaded": 0}
+        return {"total_downloaded": 0, "total_uploaded": 0}
+
+    def _save_stats(self):
+        try:
+            STATS_FILE.write_text(json.dumps(self.stats, indent=2))
+        except OSError:
+            pass
+
+    def update_stats(self):
+        """Call periodically to accumulate session stats."""
+        dl = 0
+        ul = 0
+        for h in list(self.handles.values()):
+            if h.is_valid():
+                s = h.status()
+                dl += s.total_payload_download
+                ul += s.total_payload_upload
+        prev_dl = self._prev_session_dl
+        prev_ul = self._prev_session_ul
+        delta_dl = max(0, dl - prev_dl)
+        delta_ul = max(0, ul - prev_ul)
+        self._prev_session_dl = dl
+        self._prev_session_ul = ul
+        if delta_dl > 0 or delta_ul > 0:
+            self.stats["total_downloaded"] += delta_dl
+            self.stats["total_uploaded"] += delta_ul
+            self._save_stats()
+
     def shutdown(self):
+        self.update_stats()
         self.request_save_resume_all()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -534,6 +577,17 @@ class DownloadWorker(QThread):
             self.failed.emit(f"Ошибка: {e}")
 
 
+@dataclass
+class _DlSlot:
+    result: dict
+    phase: str = "dl"           # "dl" | "copy"
+    progress: tuple = (0, "")
+    worker: object = None       # DownloadWorker | None
+    copy_worker: object = None  # CopyWorker | None
+    use_flash: bool = False
+    info_hash: str = ""
+
+
 class CopyWorker(QThread):
     progress = pyqtSignal(int, str)
     done = pyqtSignal(list)  # список сообщений (что разбито, что скопировано целиком)
@@ -568,6 +622,15 @@ class CopyWorker(QThread):
                 dst = Path(self.dst_dir) / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 size = src.stat().st_size
+                # Incremental: skip files already on destination with same size
+                if size <= self.chunk_size and dst.exists() and dst.stat().st_size == size:
+                    copied += size
+                    report.append(f"≡ {rel} ({human_bytes(size)}) — уже на флешке")
+                    self.progress.emit(
+                        int(copied * 100 / total_bytes),
+                        self._stat_line(copied, f"пропускаю {rel.name}"),
+                    )
+                    continue
                 if size <= self.chunk_size:
                     copied = self._stream_copy(src, dst, copied, total_bytes, f"копирую {rel.name}")
                     report.append(f"✓ {rel} ({human_bytes(size)})")
@@ -994,10 +1057,13 @@ class MainWindow(QMainWindow):
         self.search_workers: list[SearchWorker] = []
         self._search_in_flight: int = 0
         self._search_errors: list[str] = []
-        self.dl_worker: DownloadWorker | None = None
-        self.copy_worker: CopyWorker | None = None
-        self.dl_result: dict | None = None
-        self.dl_phase: str = ""           # "dl" | "copy"
+        self._active_dls: dict[str, _DlSlot] = {}   # keyed by _result_id(r)
+        self._flash_copy_active: CopyWorker | None = None  # one flash-copy at a time
+        self._flash_copy_queue: list[tuple] = []     # pending copies
+        self._pending_copy_worker: CopyWorker | None = None  # library auto-copy
+        self._updating = False  # flag for update-download reusing progress_box
+        # Temporary UI state for the currently displayed progress
+        self.dl_phase: str = ""
         self.dl_progress: tuple = (0, "")
         flash = detect_flash_mount()
         if flash:
@@ -1036,9 +1102,22 @@ class MainWindow(QMainWindow):
         self._auto_update_timer.setInterval(24 * 60 * 60 * 1000)
         self._auto_update_timer.timeout.connect(self._maybe_check_updates)
         self._auto_update_timer.start()
+        # Статистика загрузок — обновляем каждые 30 секунд
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(30_000)
+        self._stats_timer.timeout.connect(self.seed.update_stats)
+        self._stats_timer.start()
         # Применяем сохранённые настройки скорости и темы
         self._apply_settings()
         self._refresh_library()
+        # Keyboard shortcuts
+        QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
+        QShortcut(QKeySequence("Escape"), self, self._on_escape)
+        # Event filter for Enter on tables
+        self.table.installEventFilter(self)
+        self.lib_table.installEventFilter(self)
+        # Track previous flash state for notifications
+        self._prev_flash_mount: str | None = detect_flash_mount()
 
     # ---------- UI building ----------
 
@@ -1166,6 +1245,10 @@ class MainWindow(QMainWindow):
         info.setStyleSheet("color: #888;")
         info.setWordWrap(True)
         v.addWidget(info)
+
+        self.lib_stats_label = QLabel("")
+        self.lib_stats_label.setStyleSheet("color: #888; font-size: 11px;")
+        v.addWidget(self.lib_stats_label)
 
         # Прогресс активного авто-копирования на флешку
         self.lib_copy_box = QFrame()
@@ -1489,10 +1572,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Удалено файлов: {deleted}", 4000)
 
     def _flash_delete_all(self):
-        if self.dl_result is not None:
+        if self._active_dls:
             self._show_banner("Идёт загрузка — дождитесь завершения")
             return
-        if self.copy_worker and self.copy_worker.isRunning():
+        if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner("Идёт копирование — дождитесь завершения")
             return
         mount = detect_flash_mount()
@@ -1534,10 +1617,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Удалено все фильмы ({deleted} файлов)", 5000)
 
     def _flash_format(self):
-        if self.dl_result is not None:
+        if self._active_dls:
             self._show_banner("Идёт загрузка — дождитесь завершения перед форматированием")
             return
-        if self.copy_worker and self.copy_worker.isRunning():
+        if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner("Идёт копирование — дождитесь завершения перед форматированием")
             return
         mount = detect_flash_mount()
@@ -1694,6 +1777,11 @@ class MainWindow(QMainWindow):
         self.lib_recheck_btn.setToolTip("Принудительная проверка пиров на диске")
         self.lib_recheck_btn.clicked.connect(self._lib_force_recheck)
         actions.addWidget(self.lib_recheck_btn)
+        self.lib_files_btn = QPushButton("Файлы")
+        self.lib_files_btn.setIcon(themed_icon("document-properties", style, QStyle.SP_FileDialogDetailedView))
+        self.lib_files_btn.setToolTip("Выбрать файлы для скачивания (приоритеты)")
+        self.lib_files_btn.clicked.connect(self._lib_select_files)
+        actions.addWidget(self.lib_files_btn)
         self.lib_open_btn = QPushButton("Папка")
         self.lib_open_btn.setIcon(themed_icon("folder-open", style, QStyle.SP_DirOpenIcon))
         self.lib_open_btn.clicked.connect(self._lib_open_current_folder)
@@ -2082,6 +2170,8 @@ class MainWindow(QMainWindow):
         self.description_view.setVisible(False)
         self.description_view.clear()
         self._current_meta_url = r["page"]
+        # Обновляем кнопку/прогресс при смене выделенного результата
+        self._sync_detail_buttons(r)
         if r["page"]:
             self._meta_fetcher = MetaFetcher(r["page"])
             self._meta_fetcher.fetched.connect(self._on_meta_fetched)
@@ -2112,15 +2202,27 @@ class MainWindow(QMainWindow):
         pix = pix.scaledToWidth(280, Qt.SmoothTransformation)
         self.poster_label.setPixmap(pix)
         self.poster_label.setVisible(True)
-        # показываем прогресс, только если скачивается ИМЕННО этот элемент
-        if self.dl_result and _result_id(self.dl_result) == _result_id(r):
+
+    def _sync_detail_buttons(self, r: dict | None = None):
+        """Синхронизирует кнопку загрузки и прогресс-бар для выбранного результата."""
+        if r is None:
+            r = self.current_result()
+        if r is None:
+            return
+        # Don't hide progress_box if update download is using it
+        if self._updating:
+            return
+        rid = _result_id(r)
+        slot = self._active_dls.get(rid)
+        if slot:
+            self.dl_progress = slot.progress
+            self.dl_phase = slot.phase
             self._refresh_progress_widget()
             self.progress_box.setVisible(True)
             self.flash_btn.setEnabled(False)
         else:
             self.progress_box.setVisible(False)
-            self.flash_btn.setEnabled(self.dl_result is None)
-        self._hide_banner()
+            self.flash_btn.setEnabled(True)
 
     def _refresh_progress_widget(self):
         pct, status = self.dl_progress
@@ -2292,11 +2394,11 @@ class MainWindow(QMainWindow):
 
     def eject_flash(self):
         print("[eject] start", flush=True)
-        if self.dl_result is not None:
+        if self._active_dls:
             self._show_banner("Идёт загрузка — дождитесь завершения перед извлечением")
             print("[eject] skip: download in progress", flush=True)
             return
-        if self.copy_worker and self.copy_worker.isRunning():
+        if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner("Идёт копирование на флешку — дождитесь завершения")
             print("[eject] skip: copy in progress", flush=True)
             return
@@ -2429,79 +2531,75 @@ class MainWindow(QMainWindow):
         r = self.current_result()
         if not r:
             return
+        rid = _result_id(r)
+        if rid in self._active_dls:
+            self.statusBar().showMessage("Уже скачивается", 3000)
+            return
         try:
             STORAGE_DEFAULT.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             self._show_banner(f"Не удалось создать {STORAGE_DEFAULT}: {e}")
             return
-        # Если уже идёт загрузка — добавим в очередь
-        if self.dl_result is not None:
-            if not hasattr(self, "_dl_queue"):
-                self._dl_queue = []
-            # Сохраняем полный результат + флаг флешки. provider/page нужны
-            # для _result_id, чтобы сравнения с активной загрузкой работали.
-            entry = dict(r)
-            entry["use_flash"] = self.flash_check.isChecked()
-            if not any(_result_id(q) == _result_id(entry) for q in self._dl_queue):
-                self._dl_queue.append(entry)
-                print(
-                    f"[queue] add #{len(self._dl_queue)} id={_result_id(entry)} "
-                    f"title={r['title'][:60]}",
-                    flush=True,
-                )
-                self.statusBar().showMessage(
-                    f"В очередь #{len(self._dl_queue)}: {r['title'][:60]}", 4000
-                )
-            else:
-                self.statusBar().showMessage("Уже в очереди", 3000)
-            return
-        # Если флешка — проверяем доступ дополнительно при копировании.
         self._hide_banner()
-        self.dl_result = r
-        self.dl_phase = "dl"
-        self.dl_progress = (0, "Запуск…")
-        self._refresh_progress_widget()
-        self.progress_box.setVisible(True)
-        self.flash_btn.setEnabled(False)
-
-        self.dl_worker = DownloadWorker(
-            self.seed, r["magnet"], str(STORAGE_DEFAULT), r.get("torrent_url", ""),
-            mark_pending_flash=self.flash_check.isChecked(),
+        slot = _DlSlot(result=r, use_flash=self.flash_check.isChecked())
+        self._active_dls[rid] = slot
+        self._sync_detail_buttons()
+        worker = DownloadWorker(
+            self.seed, r["magnet"], str(STORAGE_DEFAULT),
+            r.get("torrent_url", ""),
+            mark_pending_flash=slot.use_flash,
         )
-        self.dl_worker.progress.connect(self._on_dl_progress)
-        self.dl_worker.done.connect(self._on_dl_done)
-        self.dl_worker.failed.connect(self._on_dl_failed)
-        self.dl_worker.start()
+        slot.worker = worker
+        worker.progress.connect(lambda pct, st, sid=rid: self._on_dl_progress(sid, pct, st))
+        worker.done.connect(lambda sd, rp, ih, sid=rid: self._on_dl_done(sid, sd, rp, ih))
+        worker.failed.connect(lambda err, sid=rid: self._on_dl_failed(sid, err))
+        worker.start()
 
     def _on_cancel(self):
-        if self.dl_worker and self.dl_worker.isRunning():
-            self.dl_worker.cancel()
-        if self.copy_worker and self.copy_worker.isRunning():
-            self.copy_worker.cancel()
-
-    def _on_dl_progress(self, pct: int, status: str):
-        self.dl_progress = (pct, status)
-        # обновляем UI только если просматриваем этот же элемент
         cur = self.current_result()
-        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
+        if not cur:
+            return
+        rid = _result_id(cur)
+        slot = self._active_dls.get(rid)
+        if not slot:
+            return
+        if slot.worker and slot.worker.isRunning():
+            slot.worker.cancel()
+        if slot.copy_worker and slot.copy_worker.isRunning():
+            slot.copy_worker.cancel()
+
+    def _on_dl_progress(self, slot_id: str, pct: int, status: str):
+        slot = self._active_dls.get(slot_id)
+        if not slot:
+            return
+        slot.progress = (pct, status)
+        # Update UI only if viewing this result
+        cur = self.current_result()
+        if cur and _result_id(cur) == slot_id:
+            self.dl_progress = slot.progress
+            self.dl_phase = slot.phase
             self._refresh_progress_widget()
 
-    def _on_dl_failed(self, err: str):
-        print(f"[dl] failed err={err!r}", flush=True)
-        # Сначала показываем сообщение, потом сбрасываем — иначе сообщение из
-        # _start_download_for («Из очереди…») перетирается этим, и пользователю
-        # кажется, что отмена остановила и следующие задачи в очереди.
+    def _on_dl_failed(self, slot_id: str, err: str):
+        slot = self._active_dls.pop(slot_id, None)
+        title = slot.result.get("title", "?")[:60] if slot else "?"
+        print(f"[dl] failed slot={slot_id[:20]} err={err!r}", flush=True)
         if err == "Отменено":
             self.statusBar().showMessage("Загрузка отменена", 2500)
         else:
             self._show_banner(f"Ошибка загрузки: {err}")
-        self._reset_dl_state()
+            self._notify("Ошибка загрузки", f"{title}: {err}")
+        self._sync_detail_buttons()
 
-    def _on_dl_done(self, save_dir: str, rel_paths: list, info_hash: str):
-        # Файлы лежат в ~/Storage и торрент остаётся в seed session.
-        # Если включена флешка — копируем туда дополнительно.
-        if not self.flash_check.isChecked():
-            self._reset_dl_state()
+    def _on_dl_done(self, slot_id: str, save_dir: str, rel_paths: list, info_hash: str):
+        slot = self._active_dls.get(slot_id)
+        if not slot:
+            return
+        title = slot.result.get("title", "?")[:60]
+        slot.info_hash = info_hash
+        self._notify("Загрузка завершена", title)
+        if not slot.use_flash:
+            self._active_dls.pop(slot_id, None)
             self.statusBar().showMessage(
                 f"Скачано в {save_dir}, продолжаю раздачу", 8000
             )
@@ -2509,97 +2607,93 @@ class MainWindow(QMainWindow):
                 f"Готово: файлы в {save_dir}, раздаются. Управление — на вкладке «Моя раздача».",
                 kind="info",
             )
+            self._sync_detail_buttons()
             return
-        # Копирование на флешку
-        try:
-            Path(self.dst_dir).mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            self._reset_dl_state()
-            self._show_banner(f"Не удалось создать {self.dst_dir}: {e}")
-            return
-        if not os.access(self.dst_dir, os.W_OK):
-            self._reset_dl_state()
-            self._show_banner(f"Нет прав на запись в {self.dst_dir}")
-            return
-        self.dl_phase = "copy"
-        self.dl_progress = (0, "Подготовка…")
-        cur = self.current_result()
-        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
-            self._refresh_progress_widget()
-        self.copy_worker = CopyWorker(save_dir, rel_paths, self.dst_dir, FAT32_MAX_PART)
-        self.copy_worker.progress.connect(self._on_copy_progress)
-        self.copy_worker.done.connect(self._on_copy_done)
-        self.copy_worker.failed.connect(self._on_copy_failed)
-        self.copy_worker.start()
+        # Queue flash copy
+        self._flash_copy_queue.append((slot_id, save_dir, rel_paths, info_hash))
+        self._start_next_flash_copy()
 
-    def _on_copy_progress(self, pct: int, status: str):
-        self.dl_progress = (pct, status)
+    def _on_copy_progress(self, slot_id: str, pct: int, status: str):
+        slot = self._active_dls.get(slot_id)
+        if not slot:
+            return
+        slot.progress = (pct, status)
         cur = self.current_result()
-        if cur and self.dl_result and _result_id(cur) == _result_id(self.dl_result):
+        if cur and _result_id(cur) == slot_id:
+            self.dl_progress = slot.progress
+            self.dl_phase = slot.phase
             self._refresh_progress_widget()
 
-    def _on_copy_done(self, report: list):
+    def _on_copy_done(self, slot_id: str, report: list):
+        slot = self._active_dls.pop(slot_id, None)
+        title = slot.result.get("title", "?")[:60] if slot else "?"
         summary = " · ".join(line for line in report)
-        # Сбрасываем pending_flash_copy для активного торрента
-        if self.dl_worker and self.dl_worker.info_hash in self.seed.library:
-            self.seed.library[self.dl_worker.info_hash].pop("pending_flash_copy", None)
+        # Clear pending_flash_copy for this torrent
+        if slot and slot.info_hash and slot.info_hash in self.seed.library:
+            self.seed.library[slot.info_hash].pop("pending_flash_copy", None)
             self.seed._save_library()
-        self._reset_dl_state()
+        self._flash_copy_active = None
         self.statusBar().showMessage(f"Готово: {summary}", 8000)
         self._show_banner(
             "Скопировано на флешку. Оригинал в ~/Storage, раздаётся.",
             kind="info",
         )
+        self._notify("Скопировано на флешку", title)
+        self._sync_detail_buttons()
+        # Start next queued flash copy if any
+        self._start_next_flash_copy()
 
-    def _on_copy_failed(self, err: str):
-        print(f"[copy] failed err={err!r}", flush=True)
+    def _on_copy_failed(self, slot_id: str, err: str):
+        slot = self._active_dls.pop(slot_id, None)
+        print(f"[copy] failed slot={slot_id[:20]} err={err!r}", flush=True)
+        self._flash_copy_active = None
         if err == "Отменено":
             self.statusBar().showMessage("Копирование отменено", 2500)
         else:
             self._show_banner(
                 f"Ошибка копирования: {err}. Файлы скачаны в ~/Storage, раздача идёт."
             )
-        self._reset_dl_state()
+        self._sync_detail_buttons()
+        # Start next queued flash copy if any
+        self._start_next_flash_copy()
 
-    def _reset_dl_state(self):
-        prev_id = _result_id(self.dl_result) if self.dl_result else ""
-        self.dl_result = None
-        self.dl_worker = None
-        self.copy_worker = None
-        self.dl_phase = ""
-        self.dl_progress = (0, "")
-        self.progress_box.setVisible(False)
-        self.flash_btn.setEnabled(True)
-        q_len = len(getattr(self, "_dl_queue", []) or [])
-        print(f"[queue] reset prev_id={prev_id} queue_size={q_len}", flush=True)
-        # Если есть очередь — стартуем следующий
-        if getattr(self, "_dl_queue", None):
-            next_item = self._dl_queue.pop(0)
-            self.flash_check.blockSignals(True)
-            self.flash_check.setChecked(next_item.get("use_flash", False))
-            self.flash_check.blockSignals(False)
-            # next_item уже хранит полный результат — пробрасываем как есть.
-            self._start_download_for(dict(next_item))
-
-    def _start_download_for(self, r: dict):
-        print(f"[queue] start next id={_result_id(r)} title={r.get('title','')[:60]}", flush=True)
-        self._hide_banner()
-        self.dl_result = r
-        self.dl_phase = "dl"
-        self.dl_progress = (0, "Запуск из очереди…")
-        self._refresh_progress_widget()
-        self.progress_box.setVisible(True)
-        self.flash_btn.setEnabled(False)
-        self.dl_worker = DownloadWorker(
-            self.seed, r["magnet"], str(STORAGE_DEFAULT),
-            r.get("torrent_url", ""),
-            mark_pending_flash=self.flash_check.isChecked(),
-        )
-        self.dl_worker.progress.connect(self._on_dl_progress)
-        self.dl_worker.done.connect(self._on_dl_done)
-        self.dl_worker.failed.connect(self._on_dl_failed)
-        self.dl_worker.start()
-        self.statusBar().showMessage(f"Из очереди: {r.get('title','')[:60]}", 4000)
+    def _start_next_flash_copy(self):
+        """Start the next queued flash copy, one at a time."""
+        if self._flash_copy_active and self._flash_copy_active.isRunning():
+            return
+        if not self._flash_copy_queue:
+            return
+        slot_id, save_dir, rel_paths, info_hash = self._flash_copy_queue.pop(0)
+        slot = self._active_dls.get(slot_id)
+        if not slot:
+            # Slot was cancelled/removed — try next
+            self._start_next_flash_copy()
+            return
+        dst_dir = self.dst_dir
+        try:
+            Path(dst_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._active_dls.pop(slot_id, None)
+            self._show_banner(f"Не удалось создать {dst_dir}: {e}")
+            self._sync_detail_buttons()
+            self._start_next_flash_copy()
+            return
+        if not os.access(dst_dir, os.W_OK):
+            self._active_dls.pop(slot_id, None)
+            self._show_banner(f"Нет прав на запись в {dst_dir}")
+            self._sync_detail_buttons()
+            self._start_next_flash_copy()
+            return
+        slot.phase = "copy"
+        slot.progress = (0, "Подготовка…")
+        cw = CopyWorker(save_dir, rel_paths, dst_dir, FAT32_MAX_PART)
+        slot.copy_worker = cw
+        self._flash_copy_active = cw
+        cw.progress.connect(lambda pct, st, sid=slot_id: self._on_copy_progress(sid, pct, st))
+        cw.done.connect(lambda rpt, sid=slot_id: self._on_copy_done(sid, rpt))
+        cw.failed.connect(lambda err, sid=slot_id: self._on_copy_failed(sid, err))
+        cw.start()
+        self._sync_detail_buttons()
 
     # ---------- flash info ----------
 
@@ -2607,6 +2701,11 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "flash_info"):
             return
         mount = detect_flash_mount()
+        # Notify on flash connect/disconnect
+        prev = getattr(self, "_prev_flash_mount", None)
+        if mount and not prev:
+            self._notify("Флешка подключена", mount)
+        self._prev_flash_mount = mount
         r = self.current_result()
         torrent_size = parse_size_text(r["size"]) if r else 0
 
@@ -2664,15 +2763,21 @@ class MainWindow(QMainWindow):
             self._set_lib_row(i, r)
         self._check_pending_flash_copies(rows)
         self._refresh_lib_detail()
+        # Update stats display
+        stats = self.seed.stats
+        if hasattr(self, "lib_stats_label"):
+            self.lib_stats_label.setText(
+                f"Всего скачано: {human_bytes(stats.get('total_downloaded', 0))} · "
+                f"отдано: {human_bytes(stats.get('total_uploaded', 0))}"
+            )
 
     def _check_pending_flash_copies(self, rows: list):
         """Если торрент завершён и помечен pending_flash_copy — копируем на флешку.
 
         Работает и после перезапуска: флаг хранится в library.json."""
-        if self.copy_worker and self.copy_worker.isRunning():
+        if self._pending_copy_worker and self._pending_copy_worker.isRunning():
             return
-        if self.dl_worker and self.dl_worker.isRunning():
-            # Свой обработчик _on_dl_done сам разберётся
+        if self._flash_copy_active and self._flash_copy_active.isRunning():
             return
         mount = detect_flash_mount()
         if not mount:
@@ -2700,15 +2805,15 @@ class MainWindow(QMainWindow):
             print(f"[flash] auto-copy {r['title'][:60]} → {target}", flush=True)
             self._pending_copy_hash = r["hash"]
             self._pending_copy_title = r["title"]
-            self.copy_worker = CopyWorker(meta["save_path"], rel_paths, target, FAT32_MAX_PART)
-            self.copy_worker.progress.connect(self._on_pending_copy_progress)
-            self.copy_worker.done.connect(self._on_pending_copy_done)
-            self.copy_worker.failed.connect(self._on_pending_copy_failed)
+            self._pending_copy_worker = CopyWorker(meta["save_path"], rel_paths, target, FAT32_MAX_PART)
+            self._pending_copy_worker.progress.connect(self._on_pending_copy_progress)
+            self._pending_copy_worker.done.connect(self._on_pending_copy_done)
+            self._pending_copy_worker.failed.connect(self._on_pending_copy_failed)
             self.lib_copy_phase.setText(f"Копирую на флешку: {r['title'][:80]}")
             self.lib_copy_bar.setValue(0)
             self.lib_copy_status.setText("Подготовка…")
             self.lib_copy_box.setVisible(True)
-            self.copy_worker.start()
+            self._pending_copy_worker.start()
             self.statusBar().showMessage(
                 f"Копирую на флешку: {r['title'][:60]}", 5000
             )
@@ -2722,33 +2827,28 @@ class MainWindow(QMainWindow):
 
     def _on_pending_copy_done(self, report: list):
         hid = getattr(self, "_pending_copy_hash", None)
+        title = getattr(self, "_pending_copy_title", "")[:80]
         if hid and hid in self.seed.library:
             self.seed.library[hid].pop("pending_flash_copy", None)
             self.seed._save_library()
         self._pending_copy_hash = None
-        self.copy_worker = None
+        self._pending_copy_worker = None
         if hasattr(self, "lib_copy_box"):
             self.lib_copy_box.setVisible(False)
         self.statusBar().showMessage("Скопировано на флешку", 5000)
-        if self.tray:
-            self.tray.showMessage(
-                APP_NAME,
-                f"Скопировано на флешку: {getattr(self, '_pending_copy_title', '')[:80]}",
-                QSystemTrayIcon.Information,
-                4000,
-            )
+        self._notify("Скопировано на флешку", title)
 
     def _on_pending_copy_failed(self, err: str):
         self._pending_copy_hash = None
-        self.copy_worker = None
+        self._pending_copy_worker = None
         if hasattr(self, "lib_copy_box"):
             self.lib_copy_box.setVisible(False)
         if err != "Отменено":
             self.statusBar().showMessage(f"Не удалось скопировать на флешку: {err}", 5000)
 
     def _cancel_pending_copy(self):
-        if self.copy_worker and self.copy_worker.isRunning():
-            self.copy_worker.cancel()
+        if self._pending_copy_worker and self._pending_copy_worker.isRunning():
+            self._pending_copy_worker.cancel()
 
     def _set_lib_row(self, i: int, r: dict):
         title_item = QTableWidgetItem(r["title"] or "(метаданные…)")
@@ -3063,9 +3163,10 @@ class MainWindow(QMainWindow):
         version, url, _ = self._pending_update
         binary_dir = str(Path(sys.executable).parent)
         self._update_dl = UpdateDownloader(url, binary_dir)
-        self.dl_phase = "copy"   # переиспользуем зелёный стиль для прогресса
-        self.dl_progress = (0, "Скачивание обновления…")
+        self._updating = True
         self.progress_phase.setText(f"Обновление до v{version}")
+        self.progress_bar.setValue(0)
+        self.progress_status.setText("Скачивание обновления…")
         self.progress_bar.setProperty("phase", "copy")
         self.progress_bar.style().unpolish(self.progress_bar)
         self.progress_bar.style().polish(self.progress_bar)
@@ -3080,6 +3181,7 @@ class MainWindow(QMainWindow):
         self.progress_status.setText(status)
 
     def _on_update_dl_done(self, new_path: str):
+        self._updating = False
         self.progress_box.setVisible(False)
         current = Path(sys.executable)
         try:
@@ -3097,6 +3199,7 @@ class MainWindow(QMainWindow):
         os.execv(str(current), [str(current)] + sys.argv[1:])
 
     def _on_update_dl_failed(self, err: str):
+        self._updating = False
         self.progress_box.setVisible(False)
         self._show_banner(f"Не удалось скачать обновление: {err}")
 
@@ -3107,6 +3210,105 @@ class MainWindow(QMainWindow):
     def _on_update_check_failed(self, err: str):
         if not getattr(self, "_update_silent", False):
             self.statusBar().showMessage(f"Проверка обновлений не удалась: {err}", 5000)
+
+    # ---------- notifications ----------
+
+    def _notify(self, title: str, body: str):
+        """Send desktop notification via notify-send."""
+        try:
+            icon_path = str(Path(__file__).resolve().parent / "torflash.svg")
+            cmd = ["notify-send", "-a", APP_NAME, "-i", icon_path, title, body]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (FileNotFoundError, OSError):
+            pass  # notify-send not available
+
+    # ---------- keyboard shortcuts ----------
+
+    def _focus_search(self):
+        self.tabs.setCurrentIndex(0)
+        self.input.setFocus()
+        self.input.selectAll()
+
+    def _on_escape(self):
+        if self.input.hasFocus() and self.input.text():
+            self.input.clear()
+        else:
+            cur = self.current_result()
+            if cur:
+                rid = _result_id(cur)
+                slot = self._active_dls.get(rid)
+                if slot:
+                    self._on_cancel()
+
+    def eventFilter(self, obj, event):
+        if event.type() == event.KeyPress:
+            if obj is self.table and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.download_to_flash()
+                return True
+            if obj is self.lib_table and event.key() == Qt.Key_Delete:
+                hid = self._selected_lib_hash()
+                if hid:
+                    self._lib_remove(hid, delete_files=False)
+                return True
+        return super().eventFilter(obj, event)
+
+    # ---------- selective file download ----------
+
+    def _lib_select_files(self):
+        hid = self._selected_lib_hash()
+        if not hid:
+            return
+        h = self.seed.handles.get(hid)
+        if not h or not h.status().has_metadata:
+            self.statusBar().showMessage("Метаданные ещё не получены", 3000)
+            return
+        info = h.torrent_file()
+        files = info.files()
+        current_prio = h.file_priorities()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Выбор файлов")
+        dlg.resize(600, 400)
+        layout = QVBoxLayout(dlg)
+
+        # Select all / none
+        top = QHBoxLayout()
+        btn_all = QPushButton("Выбрать все")
+        btn_none = QPushButton("Снять все")
+        top.addWidget(btn_all)
+        top.addWidget(btn_none)
+        top.addStretch()
+        layout.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QVBoxLayout(inner)
+
+        checks = []
+        for i in range(files.num_files()):
+            path = files.file_path(i)
+            size = files.file_size(i)
+            cb = QCheckBox(f"{path}  ({human_bytes(size)})")
+            cb.setChecked(current_prio[i] > 0)
+            form.addWidget(cb)
+            checks.append(cb)
+
+        btn_all.clicked.connect(lambda: [c.setChecked(True) for c in checks])
+        btn_none.clicked.connect(lambda: [c.setChecked(False) for c in checks])
+
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() == QDialog.Accepted:
+            prio = [4 if c.isChecked() else 0 for c in checks]
+            h.prioritize_files(prio)
+            self.statusBar().showMessage("Приоритеты файлов обновлены", 3000)
 
 
 def setup_icon_theme():
