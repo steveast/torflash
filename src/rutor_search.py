@@ -872,6 +872,18 @@ class SearchWorker(QThread):
             self.failed.emit(self.provider.name, f"{type(e).__name__}: {e}")
 
 
+class _SortableItem(QTableWidgetItem):
+    """QTableWidgetItem, который сортируется по числовому значению, а не по тексту."""
+    def __init__(self, text: str, sort_value):
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other):
+        if isinstance(other, _SortableItem):
+            return self._sort_value < other._sort_value
+        return super().__lt__(other)
+
+
 MAGNET_HASH_RE = re.compile(r"btih:([a-f0-9]+)", re.I)
 
 
@@ -1309,6 +1321,7 @@ class MainWindow(QMainWindow):
         self.lib_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.lib_table.setSelectionMode(QTableWidget.SingleSelection)
         self.lib_table.setAlternatingRowColors(True)
+        self.lib_table.setSortingEnabled(True)
         self.lib_table.verticalHeader().setVisible(False)
         lh = self.lib_table.horizontalHeader()
         lh.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -2770,10 +2783,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_library(self):
         rows = self.seed.all_statuses()
-        rows.sort(key=lambda r: (r["progress"] >= 1.0, -r["upload_rate"]))
+        # Remember selection and sort state
+        prev_hash = self._selected_lib_hash()
+        self.lib_table.setSortingEnabled(False)
         self.lib_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
             self._set_lib_row(i, r)
+        self.lib_table.setSortingEnabled(True)
+        # Restore selection
+        if prev_hash:
+            for i in range(self.lib_table.rowCount()):
+                it = self.lib_table.item(i, 0)
+                if it and it.data(Qt.UserRole) == prev_hash:
+                    self.lib_table.selectRow(i)
+                    break
         self._check_pending_flash_copies(rows)
         self._refresh_lib_detail()
         # Update stats display
@@ -2866,7 +2889,9 @@ class MainWindow(QMainWindow):
     def _set_lib_row(self, i: int, r: dict):
         title_item = QTableWidgetItem(r["title"] or "(метаданные…)")
         title_item.setData(Qt.UserRole, r["hash"])
-        size_item = QTableWidgetItem(human_bytes(r["size"]) if r["size"] else "?")
+
+        size_item = _SortableItem(human_bytes(r["size"]) if r["size"] else "?", r["size"])
+
         pct = int(r["progress"] * 100)
         if r["is_seeding"] or pct == 100:
             prog_text = "раздача"
@@ -2874,14 +2899,17 @@ class MainWindow(QMainWindow):
             prog_text = f"{r['state']} {pct}%"
         else:
             prog_text = "метаданные…"
-        prog_item = QTableWidgetItem(prog_text)
+        prog_item = _SortableItem(prog_text, r["progress"])
         prog_item.setTextAlignment(Qt.AlignCenter)
-        down_item = QTableWidgetItem(f"{human_bytes(r['download_rate'])}/s")
-        up_item = QTableWidgetItem(f"{human_bytes(r['upload_rate'])}/s")
+
+        down_item = _SortableItem(f"{human_bytes(r['download_rate'])}/s", r["download_rate"])
+        up_item = _SortableItem(f"{human_bytes(r['upload_rate'])}/s", r["upload_rate"])
         if r["upload_rate"] > 0:
             up_item.setForeground(Qt.green)
-        peers_item = QTableWidgetItem(f"{r['num_peers']} ({r['num_seeds']}↑)")
+
+        peers_item = _SortableItem(f"{r['num_peers']} ({r['num_seeds']}↑)", r["num_peers"])
         peers_item.setTextAlignment(Qt.AlignCenter)
+
         for col, item in enumerate(
             (title_item, size_item, prog_item, down_item, up_item, peers_item)
         ):
