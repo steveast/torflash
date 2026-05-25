@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TorFlash
+GenericName=Torrent Downloader
+Comment=Search, download and flash-copy torrents
+Exec=TorFlash
+Icon=torflash
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+Keywords=torrent;download;flash;usb;
+StartupWMClass=TorFlash
