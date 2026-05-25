@@ -9,7 +9,7 @@ datas = [
     ('assets/torflash-tray-48.png', '.'),
 ]
 binaries = []
-hiddenimports = ['requests', 'rutor_meta', 'mediainfo', 'themes', 'providers', 'providers.rutor', 'providers.nnm', 'providers.base']
+hiddenimports = ['requests', 'rutor_meta', 'mediainfo', 'themes', 'providers', 'providers.rutor', 'providers.nnm', 'providers.rutracker', 'providers.base']
 tmp_ret = collect_all('requests')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

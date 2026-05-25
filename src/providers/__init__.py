@@ -5,8 +5,9 @@ seeds, leech, magnet, torrent_url, page, date."""
 from .base import Provider, HEADERS
 from .rutor import RutorProvider
 from .nnm import NnmProvider
+from .rutracker import RuTrackerProvider
 
-ALL_PROVIDERS: list[Provider] = [RutorProvider(), NnmProvider()]
+ALL_PROVIDERS: list[Provider] = [RutorProvider(), NnmProvider(), RuTrackerProvider()]
 
 
 def get_provider(name: str) -> Provider | None:

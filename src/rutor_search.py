@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 GITHUB_REPO = "steveast/torflash"
 
 import faulthandler
@@ -48,7 +48,7 @@ EXTRA_TRACKERS = [
 
 SEARCH_HISTORY_MAX = 30
 from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QGuiApplication, QIcon, QKeySequence
+from PyQt5.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -309,13 +309,14 @@ class SeedSession:
             except (RuntimeError, OSError, ValueError, TypeError) as e:
                 print(f"[seed] restore failed for {hid}: {e}", flush=True)
 
-    def add(self, magnet: str, torrent_url: str, save_path: str):
+    def add(self, magnet: str, torrent_url: str, save_path: str, cookies=None):
         params = None
         torrent_bytes = None
         if torrent_url:
             try:
                 r = requests.get(
-                    torrent_url, headers=HEADERS, timeout=20, allow_redirects=True
+                    torrent_url, headers=HEADERS, timeout=20,
+                    allow_redirects=True, cookies=cookies,
                 )
                 r.raise_for_status()
                 torrent_bytes = r.content
@@ -458,12 +459,16 @@ class SeedSession:
             print(f"[seed] apply_rate_limits failed: {e}", flush=True)
 
     def _load_stats(self) -> dict:
+        default = {"total_downloaded": 0, "total_uploaded": 0, "daily": {}}
         if STATS_FILE.exists():
             try:
-                return json.loads(STATS_FILE.read_text())
+                data = json.loads(STATS_FILE.read_text())
+                if "daily" not in data:
+                    data["daily"] = {}
+                return data
             except (json.JSONDecodeError, OSError):
-                return {"total_downloaded": 0, "total_uploaded": 0}
-        return {"total_downloaded": 0, "total_uploaded": 0}
+                return default
+        return default
 
     def _save_stats(self):
         try:
@@ -489,6 +494,16 @@ class SeedSession:
         if delta_dl > 0 or delta_ul > 0:
             self.stats["total_downloaded"] += delta_dl
             self.stats["total_uploaded"] += delta_ul
+            # Дневная статистика
+            today = time.strftime("%Y-%m-%d")
+            daily = self.stats.setdefault("daily", {})
+            day = daily.setdefault(today, {"dl": 0, "ul": 0})
+            day["dl"] += delta_dl
+            day["ul"] += delta_ul
+            # Храним только последние 90 дней
+            if len(daily) > 90:
+                for old_key in sorted(daily.keys())[:-90]:
+                    del daily[old_key]
             self._save_stats()
 
     def shutdown(self):
@@ -506,13 +521,15 @@ class DownloadWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, seed: SeedSession, magnet: str, save_dir: str,
-                 torrent_url: str = "", mark_pending_flash: bool = False):
+                 torrent_url: str = "", mark_pending_flash: bool = False,
+                 cookies=None):
         super().__init__()
         self.seed = seed
         self.magnet = magnet
         self.torrent_url = torrent_url
         self.save_dir = save_dir
         self.mark_pending_flash = mark_pending_flash
+        self.cookies = cookies
         self._cancel = False
         self.info_hash = ""
 
@@ -522,7 +539,8 @@ class DownloadWorker(QThread):
     def run(self):
         try:
             print(f"[DL] start save_dir={self.save_dir}", flush=True)
-            self.info_hash = self.seed.add(self.magnet, self.torrent_url, self.save_dir)
+            self.info_hash = self.seed.add(self.magnet, self.torrent_url, self.save_dir,
+                                           cookies=self.cookies)
             handle = self.seed.handles[self.info_hash]
             if self.mark_pending_flash and self.info_hash in self.seed.library:
                 self.seed.library[self.info_hash]["pending_flash_copy"] = True
@@ -963,109 +981,74 @@ def themed_icon(name: str, style=None, fallback=None) -> QIcon:
     return QIcon()
 
 
-class SettingsDialog(QDialog):
-    applied = pyqtSignal()
 
-    def __init__(self, settings: QSettings, parent=None):
+
+class SpeedGraph(QWidget):
+    """Живой график скорости загрузки/раздачи. Рисуется через QPainter."""
+
+    HISTORY = 60  # точек (2 мин при обновлении каждые 2 сек)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"{APP_NAME} — настройки")
-        self.settings = settings
-        v = QVBoxLayout(self)
-        v.setSpacing(10)
+        self.setFixedHeight(80)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._dl: list[float] = [0.0] * self.HISTORY
+        self._ul: list[float] = [0.0] * self.HISTORY
+        self._peak: float = 1.0  # avoid div-by-zero
 
-        # Поведение окна
-        self.cb_minimize = QCheckBox("Сворачивать в трей при закрытии окна")
-        self.cb_minimize.setChecked(
-            settings.value("minimize_on_close", True, type=bool)
-        )
-        v.addWidget(self.cb_minimize)
-        self.cb_autostart = QCheckBox("Запускать при входе в систему")
-        self.cb_autostart.setChecked(AUTOSTART_FILE.exists())
-        v.addWidget(self.cb_autostart)
-        self.cb_hidden = QCheckBox("Скрытый старт (только иконка в трее)")
-        self.cb_hidden.setChecked(
-            settings.value("start_hidden", False, type=bool)
-        )
-        v.addWidget(self.cb_hidden)
-        self.cb_auto_update = QCheckBox("Автоматически проверять обновления (раз в сутки)")
-        self.cb_auto_update.setChecked(
-            settings.value("auto_check_updates", True, type=bool)
-        )
-        v.addWidget(self.cb_auto_update)
+    def push(self, dl_rate: float, ul_rate: float):
+        self._dl.append(dl_rate)
+        self._ul.append(ul_rate)
+        self._dl = self._dl[-self.HISTORY:]
+        self._ul = self._ul[-self.HISTORY:]
+        self._peak = max(max(self._dl), max(self._ul), 1.0)
+        self.update()
 
-        # Тема
-        theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel("Тема:"))
-        self.cb_theme = QComboBox()
-        for label, val in (("Системная", "auto"), ("Светлая", "light"), ("Тёмная", "dark")):
-            self.cb_theme.addItem(label, val)
-        current_theme = settings.value("theme", "auto", type=str)
-        for i in range(self.cb_theme.count()):
-            if self.cb_theme.itemData(i) == current_theme:
-                self.cb_theme.setCurrentIndex(i)
-                break
-        theme_row.addWidget(self.cb_theme, 1)
-        v.addLayout(theme_row)
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        margin_bottom = 14
 
-        # Лимиты скорости
-        v.addWidget(QLabel("<b>Лимиты скорости</b> (КБ/с, 0 — без ограничений):"))
-        rate_form = QFormLayout()
-        rate_form.setHorizontalSpacing(10)
-        self.sp_down = QSpinBox()
-        self.sp_down.setRange(0, 1_000_000)
-        self.sp_down.setSuffix(" КБ/с")
-        self.sp_down.setValue(settings.value("rate_limit_down", 0, type=int))
-        self.sp_up = QSpinBox()
-        self.sp_up.setRange(0, 1_000_000)
-        self.sp_up.setSuffix(" КБ/с")
-        self.sp_up.setValue(settings.value("rate_limit_up", 0, type=int))
-        rate_form.addRow("Скачивание ↓:", self.sp_down)
-        rate_form.addRow("Раздача ↑:", self.sp_up)
-        v.addLayout(rate_form)
+        # Фон
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 15))
 
-        info = QLabel(
-            "Скачивание всегда идёт в <b>~/Storage</b>. Файлы хранятся там до "
-            "ручного удаления из вкладки «Моя раздача»."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("color: #888; padding-top: 6px;")
-        v.addWidget(info)
+        draw_h = h - margin_bottom
+        n = len(self._dl)
+        step = w / max(n - 1, 1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._apply)
-        buttons.rejected.connect(self.reject)
-        v.addWidget(buttons)
+        def y(val):
+            return draw_h - (val / self._peak) * (draw_h - 4)
 
-    def _apply(self):
-        self.settings.setValue("minimize_on_close", self.cb_minimize.isChecked())
-        self.settings.setValue("start_hidden", self.cb_hidden.isChecked())
-        self.settings.setValue("auto_check_updates", self.cb_auto_update.isChecked())
-        self.settings.setValue("theme", self.cb_theme.currentData())
-        self.settings.setValue("rate_limit_down", int(self.sp_down.value()))
-        self.settings.setValue("rate_limit_up", int(self.sp_up.value()))
-        self._apply_autostart(self.cb_autostart.isChecked())
-        self.applied.emit()
-        self.accept()
-
-    def _apply_autostart(self, enabled: bool):
-        if enabled:
-            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
-            exe = sys.executable if getattr(sys, "frozen", False) else f"/usr/bin/python3 {Path(__file__).resolve()}"
-            icon = ASSETS_DIR / "torflash.svg"
-            content = (
-                "[Desktop Entry]\n"
-                "Type=Application\n"
-                f"Name={APP_NAME}\n"
-                f"Exec={exe} --hidden\n"
-                f"Icon={icon}\n"
-                "Terminal=false\n"
-                "X-GNOME-Autostart-enabled=true\n"
-                f"X-KDE-autostart-after=panel\n"
+        # Download (синий)
+        p.setPen(QPen(QColor(60, 130, 240, 180), 1.5))
+        for i in range(1, n):
+            p.drawLine(
+                int((i - 1) * step), int(y(self._dl[i - 1])),
+                int(i * step), int(y(self._dl[i]))
             )
-            AUTOSTART_FILE.write_text(content)
-            AUTOSTART_FILE.chmod(0o755)
-        else:
-            AUTOSTART_FILE.unlink(missing_ok=True)
+        # Upload (зелёный)
+        p.setPen(QPen(QColor(80, 200, 80, 180), 1.5))
+        for i in range(1, n):
+            p.drawLine(
+                int((i - 1) * step), int(y(self._ul[i - 1])),
+                int(i * step), int(y(self._ul[i]))
+            )
+
+        # Подписи
+        p.setPen(QColor(130, 130, 130))
+        font = p.font()
+        font.setPixelSize(10)
+        p.setFont(font)
+        peak_text = f"пик: {human_bytes(self._peak)}/с"
+        p.drawText(4, h - 2, peak_text)
+        # Легенда справа
+        lx = w - 120
+        p.setPen(QColor(60, 130, 240))
+        p.drawText(lx, h - 2, f"↓ {human_bytes(self._dl[-1])}/с")
+        p.setPen(QColor(80, 200, 80))
+        p.drawText(lx + 60, h - 2, f"↑ {human_bytes(self._ul[-1])}/с")
+        p.end()
 
 
 class MainWindow(QMainWindow):
@@ -1159,6 +1142,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_search_tab(), "Поиск")
         tabs.addTab(self._build_library_tab(), "Моя раздача")
         tabs.addTab(self._build_flash_tab(), "Флешка")
+        tabs.addTab(self._build_settings_tab(), "Настройки")
         tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(tabs, 1)
         self.tabs = tabs
@@ -1275,6 +1259,9 @@ class MainWindow(QMainWindow):
         self.lib_stats_label = QLabel("")
         self.lib_stats_label.setStyleSheet("color: #888; font-size: 11px;")
         v.addWidget(self.lib_stats_label)
+
+        self.speed_graph = SpeedGraph()
+        v.addWidget(self.speed_graph)
 
         # Прогресс активного авто-копирования на флешку
         self.lib_copy_box = QFrame()
@@ -1416,6 +1403,147 @@ class MainWindow(QMainWindow):
         self._flash_arm_timer.timeout.connect(self._disarm_flash_btn)
 
         return wrap
+
+    def _build_settings_tab(self) -> QWidget:
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        # Поведение окна
+        v.addWidget(QLabel("<b>Приложение</b>"))
+        self.cb_minimize = QCheckBox("Сворачивать в трей при закрытии окна")
+        self.cb_minimize.setChecked(
+            self.settings.value("minimize_on_close", True, type=bool)
+        )
+        self.cb_minimize.toggled.connect(
+            lambda c: self.settings.setValue("minimize_on_close", c)
+        )
+        v.addWidget(self.cb_minimize)
+        self.cb_autostart = QCheckBox("Запускать при входе в систему")
+        self.cb_autostart.setChecked(AUTOSTART_FILE.exists())
+        self.cb_autostart.toggled.connect(self._apply_autostart)
+        v.addWidget(self.cb_autostart)
+        self.cb_hidden = QCheckBox("Скрытый старт (только иконка в трее)")
+        self.cb_hidden.setChecked(
+            self.settings.value("start_hidden", False, type=bool)
+        )
+        self.cb_hidden.toggled.connect(
+            lambda c: self.settings.setValue("start_hidden", c)
+        )
+        v.addWidget(self.cb_hidden)
+        self.cb_auto_update = QCheckBox("Автоматически проверять обновления (раз в сутки)")
+        self.cb_auto_update.setChecked(
+            self.settings.value("auto_check_updates", True, type=bool)
+        )
+        self.cb_auto_update.toggled.connect(
+            lambda c: self.settings.setValue("auto_check_updates", c)
+        )
+        v.addWidget(self.cb_auto_update)
+
+        # Тема
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Тема:"))
+        self.cb_theme = QComboBox()
+        for label, val in (("Системная", "auto"), ("Светлая", "light"), ("Тёмная", "dark")):
+            self.cb_theme.addItem(label, val)
+        current_theme = self.settings.value("theme", "auto", type=str)
+        for i in range(self.cb_theme.count()):
+            if self.cb_theme.itemData(i) == current_theme:
+                self.cb_theme.setCurrentIndex(i)
+                break
+        self.cb_theme.currentIndexChanged.connect(self._on_theme_changed)
+        theme_row.addWidget(self.cb_theme, 1)
+        theme_row.addStretch()
+        v.addLayout(theme_row)
+
+        # Лимиты скорости
+        v.addWidget(QLabel("<b>Лимиты скорости</b> (КБ/с, 0 — без ограничений):"))
+        rate_form = QFormLayout()
+        rate_form.setHorizontalSpacing(10)
+        self.sp_down = QSpinBox()
+        self.sp_down.setRange(0, 1_000_000)
+        self.sp_down.setSuffix(" КБ/с")
+        self.sp_down.setValue(self.settings.value("rate_limit_down", 0, type=int))
+        self.sp_down.valueChanged.connect(self._on_rate_changed)
+        self.sp_up = QSpinBox()
+        self.sp_up.setRange(0, 1_000_000)
+        self.sp_up.setSuffix(" КБ/с")
+        self.sp_up.setValue(self.settings.value("rate_limit_up", 0, type=int))
+        self.sp_up.valueChanged.connect(self._on_rate_changed)
+        rate_form.addRow("Скачивание ↓:", self.sp_down)
+        rate_form.addRow("Раздача ↑:", self.sp_up)
+        v.addLayout(rate_form)
+
+        # RuTracker
+        v.addWidget(QLabel("<b>RuTracker</b> (требуется аккаунт):"))
+        rt_form = QFormLayout()
+        rt_form.setHorizontalSpacing(10)
+        self.rt_user = QLineEdit(self.settings.value("rutracker_user", "", type=str))
+        self.rt_user.setPlaceholderText("логин на rutracker.org")
+        self.rt_user.editingFinished.connect(self._save_rt_credentials)
+        self.rt_pass = QLineEdit(self.settings.value("rutracker_pass", "", type=str))
+        self.rt_pass.setPlaceholderText("пароль")
+        self.rt_pass.setEchoMode(QLineEdit.Password)
+        self.rt_pass.editingFinished.connect(self._save_rt_credentials)
+        self.rt_proxy = QLineEdit(self.settings.value("rutracker_proxy", "", type=str))
+        self.rt_proxy.setPlaceholderText("socks5://127.0.0.1:1080 или http://proxy:8080")
+        self.rt_proxy.editingFinished.connect(self._save_rt_credentials)
+        rt_form.addRow("Логин:", self.rt_user)
+        rt_form.addRow("Пароль:", self.rt_pass)
+        rt_form.addRow("Прокси:", self.rt_proxy)
+        v.addLayout(rt_form)
+
+        info = QLabel(
+            "Скачивание всегда идёт в <b>~/Storage</b>. Файлы хранятся там до "
+            "ручного удаления из вкладки «Моя раздача»."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888; padding-top: 6px;")
+        v.addWidget(info)
+
+        v.addStretch()
+        outer.setWidget(inner)
+        return outer
+
+    def _on_theme_changed(self):
+        theme = self.cb_theme.currentData()
+        self.settings.setValue("theme", theme)
+        try:
+            from themes import apply_theme
+            apply_theme(QApplication.instance(), theme)
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+    def _on_rate_changed(self):
+        down = self.sp_down.value()
+        up = self.sp_up.value()
+        self.settings.setValue("rate_limit_down", down)
+        self.settings.setValue("rate_limit_up", up)
+        self.seed.apply_rate_limits(down, up)
+
+    def _apply_autostart(self, enabled: bool):
+        if enabled:
+            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            exe = sys.executable if getattr(sys, "frozen", False) else f"/usr/bin/python3 {Path(__file__).resolve()}"
+            icon = ASSETS_DIR / "torflash.svg"
+            content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                f"Exec={exe} --hidden\n"
+                f"Icon={icon}\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+                f"X-KDE-autostart-after=panel\n"
+            )
+            AUTOSTART_FILE.write_text(content)
+            AUTOSTART_FILE.chmod(0o755)
+        else:
+            AUTOSTART_FILE.unlink(missing_ok=True)
 
     def _on_tab_changed(self, index: int):
         if index == 2:
@@ -1919,6 +2047,24 @@ class MainWindow(QMainWindow):
         self.poster_label.setMinimumHeight(0)
         self.poster_label.setVisible(False)
         card_v.addWidget(self.poster_label)
+
+        # Галерея скриншотов (горизонтальная прокрутка)
+        self.screenshots_scroll = QScrollArea()
+        self.screenshots_scroll.setWidgetResizable(True)
+        self.screenshots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.screenshots_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.screenshots_scroll.setFrameShape(QFrame.NoFrame)
+        self.screenshots_scroll.setFixedHeight(160)
+        self.screenshots_scroll.setVisible(False)
+        self._screenshots_widget = QWidget()
+        self._screenshots_layout = QHBoxLayout(self._screenshots_widget)
+        self._screenshots_layout.setContentsMargins(0, 0, 0, 0)
+        self._screenshots_layout.setSpacing(6)
+        self._screenshots_layout.addStretch()
+        self.screenshots_scroll.setWidget(self._screenshots_widget)
+        card_v.addWidget(self.screenshots_scroll)
+        self._screenshot_fetchers: list = []
+
         self.description_view = QTextBrowser()
         self.description_view.setOpenExternalLinks(True)
         self.description_view.setMaximumHeight(200)
@@ -2000,18 +2146,44 @@ class MainWindow(QMainWindow):
         outer.setWidget(inner)
         return outer
 
+    def _install_tray_icons(self):
+        """Копируем иконки трея в ~/.local/share/icons/hicolor/ чтобы KDE Plasma
+        находила их по имени, а не по временному пути из PyInstaller."""
+        icon_dir = Path.home() / ".local" / "share" / "icons" / "hicolor"
+        mapping = {
+            "torflash-tray-22.png": "22x22/apps/torflash-tray.png",
+            "torflash-tray-32.png": "32x32/apps/torflash-tray.png",
+            "torflash-tray-48.png": "48x48/apps/torflash-tray.png",
+            "torflash-tray.svg": "scalable/apps/torflash-tray.svg",
+            "torflash.svg": "scalable/apps/torflash.svg",
+        }
+        for src_name, dst_rel in mapping.items():
+            src = ASSETS_DIR / src_name
+            if not src.exists():
+                continue
+            dst = icon_dir / dst_rel
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+                    shutil.copy2(src, dst)
+            except OSError:
+                pass
+
     def _build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = None
             return
-        # Для трея — отдельная упрощённая иконка (без анимаций и мелких деталей)
-        tray_path = ASSETS_DIR / "torflash-tray.svg"
-        icon = QIcon(str(tray_path)) if tray_path.exists() else self.windowIcon()
-        # Добавим PNG-варианты разных размеров — KDE предпочитает их при выборе
-        for size in (22, 32, 48):
-            png = ASSETS_DIR / f"torflash-tray-{size}.png"
-            if png.exists():
-                icon.addFile(str(png))
+        self._install_tray_icons()
+        # KDE Plasma ищет по имени в hicolor; Qt тоже пробует fromTheme
+        icon = QIcon.fromTheme("torflash-tray")
+        if icon.isNull() or not icon.availableSizes():
+            # Фолбэк: из ASSETS_DIR напрямую
+            tray_path = ASSETS_DIR / "torflash-tray.svg"
+            icon = QIcon(str(tray_path)) if tray_path.exists() else self.windowIcon()
+            for size in (22, 32, 48):
+                png = ASSETS_DIR / f"torflash-tray-{size}.png"
+                if png.exists():
+                    icon.addFile(str(png))
 
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip(APP_NAME)
@@ -2049,9 +2221,8 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def open_settings(self):
-        dlg = SettingsDialog(self.settings, self)
-        dlg.applied.connect(self._apply_settings)
-        dlg.exec_()
+        self._tray_show()
+        self.tabs.setCurrentIndex(3)  # вкладка «Настройки»
 
     def _apply_settings(self):
         down = self.settings.value("rate_limit_down", 0, type=int)
@@ -2063,6 +2234,14 @@ class MainWindow(QMainWindow):
             apply_theme(QApplication.instance(), theme)
         except (ImportError, ModuleNotFoundError) as e:
             print(f"[main] theme module unavailable: {e}", flush=True)
+        # RuTracker credentials
+        rt = get_provider("rutracker")
+        if rt and hasattr(rt, "set_credentials"):
+            rt.set_credentials(
+                self.settings.value("rutracker_user", "", type=str),
+                self.settings.value("rutracker_pass", "", type=str),
+                self.settings.value("rutracker_proxy", "", type=str),
+            )
 
     def _maybe_check_updates(self):
         if not self.settings.value("auto_check_updates", True, type=bool):
@@ -2193,6 +2372,8 @@ class MainWindow(QMainWindow):
         # Сбрасываем постер/описание, запускаем фоновое получение деталей
         self.poster_label.setVisible(False)
         self.poster_label.clear()
+        self.screenshots_scroll.setVisible(False)
+        self._clear_screenshots()
         self.description_view.setVisible(False)
         self.description_view.clear()
         self._current_meta_url = r["page"]
@@ -2216,6 +2397,15 @@ class MainWindow(QMainWindow):
             self._poster_fetcher = PosterFetcher(poster_url, referer=url)
             self._poster_fetcher.loaded.connect(self._on_poster_loaded)
             self._poster_fetcher.start()
+        # Скриншоты
+        screenshots = data.get("screenshots") or []
+        if screenshots:
+            self._screenshot_fetchers = []
+            for surl in screenshots[:12]:
+                f = PosterFetcher(surl, referer=url)
+                f.loaded.connect(self._on_screenshot_loaded)
+                self._screenshot_fetchers.append(f)
+                f.start()
 
     def _on_poster_loaded(self, url: str, data: bytes):
         if not data:
@@ -2228,6 +2418,64 @@ class MainWindow(QMainWindow):
         pix = pix.scaledToWidth(280, Qt.SmoothTransformation)
         self.poster_label.setPixmap(pix)
         self.poster_label.setVisible(True)
+
+    def _clear_screenshots(self):
+        while self._screenshots_layout.count() > 1:
+            item = self._screenshots_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._screenshot_fetchers = []
+
+    def _on_screenshot_loaded(self, url: str, data: bytes):
+        if not data:
+            return
+        from PyQt5.QtGui import QPixmap
+        pix = QPixmap()
+        pix.loadFromData(data)
+        if pix.isNull():
+            return
+        pix = pix.scaledToHeight(140, Qt.SmoothTransformation)
+        lbl = QLabel()
+        lbl.setPixmap(pix)
+        lbl.setCursor(Qt.PointingHandCursor)
+        lbl.setToolTip("Клик для увеличения")
+        lbl.mousePressEvent = lambda e, p=pix, u=url: self._show_screenshot_full(p, u)
+        # Вставляем перед stretch
+        self._screenshots_layout.insertWidget(self._screenshots_layout.count() - 1, lbl)
+        self.screenshots_scroll.setVisible(True)
+
+    def _show_screenshot_full(self, thumb_pix, url: str):
+        """Показать скриншот в полном размере в отдельном окне."""
+        from PyQt5.QtGui import QPixmap
+        from PyQt5.QtWidgets import QDialog, QLabel, QVBoxLayout, QScrollArea
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Скриншот")
+        dlg.resize(900, 600)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        # Загрузим полноразмерную версию (fastpic: заменяем /thumb/ на /big/)
+        full_url = url.replace("/thumb/", "/big/")
+        try:
+            import requests
+            r = requests.get(full_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code == 200:
+                full_pix = QPixmap()
+                full_pix.loadFromData(r.content)
+                if not full_pix.isNull():
+                    lbl.setPixmap(full_pix)
+                else:
+                    lbl.setPixmap(thumb_pix)
+            else:
+                lbl.setPixmap(thumb_pix)
+        except Exception:
+            lbl.setPixmap(thumb_pix)
+        scroll.setWidget(lbl)
+        v.addWidget(scroll)
+        dlg.exec_()
 
     def _sync_detail_buttons(self, r: dict | None = None):
         """Синхронизирует кнопку загрузки и прогресс-бар для выбранного результата."""
@@ -2269,6 +2517,17 @@ class MainWindow(QMainWindow):
     def _save_enabled_providers(self):
         enabled = [n for n, cb in self.provider_checks.items() if cb.isChecked()]
         self.settings.setValue("enabled_providers", enabled)
+
+    def _save_rt_credentials(self):
+        user = self.rt_user.text().strip()
+        pwd = self.rt_pass.text()
+        proxy = self.rt_proxy.text().strip()
+        self.settings.setValue("rutracker_user", user)
+        self.settings.setValue("rutracker_pass", pwd)
+        self.settings.setValue("rutracker_proxy", proxy)
+        rt = get_provider("rutracker")
+        if rt and hasattr(rt, "set_credentials"):
+            rt.set_credentials(user, pwd, proxy)
 
     def _enabled_providers(self) -> list:
         return [p for p in ALL_PROVIDERS if self.provider_checks[p.name].isChecked()]
@@ -2346,9 +2605,13 @@ class MainWindow(QMainWindow):
                 ("leech", r["leech"]),
             )
             for j, (key, text) in enumerate(cells):
-                item = QTableWidgetItem(text)
                 if key in ("seeds", "leech"):
+                    item = _SortableItem(text, int(text) if text.isdigit() else 0)
                     item.setTextAlignment(Qt.AlignCenter)
+                elif key == "size":
+                    item = _SortableItem(text, parse_size_text(text))
+                else:
+                    item = QTableWidgetItem(text)
                 if j == 0:
                     item.setData(Qt.UserRole, r)
                 self.table.setItem(i, j, item)
@@ -2570,10 +2833,16 @@ class MainWindow(QMainWindow):
         slot = _DlSlot(result=r, use_flash=self.flash_check.isChecked())
         self._active_dls[rid] = slot
         self._sync_detail_buttons()
+        # Для провайдеров с авторизацией (RuTracker) передаём cookies сессии
+        cookies = None
+        prov = get_provider(r.get("provider", ""))
+        if prov and hasattr(prov, "_session") and prov._session:
+            cookies = prov._session.cookies
         worker = DownloadWorker(
             self.seed, r["magnet"], str(STORAGE_DEFAULT),
             r.get("torrent_url", ""),
             mark_pending_flash=slot.use_flash,
+            cookies=cookies,
         )
         slot.worker = worker
         worker.progress.connect(lambda pct, st, sid=rid: self._on_dl_progress(sid, pct, st))
@@ -2799,12 +3068,23 @@ class MainWindow(QMainWindow):
                     break
         self._check_pending_flash_copies(rows)
         self._refresh_lib_detail()
+        # Суммарная скорость для графика
+        total_dl_rate = sum(r.get("download_rate", 0) for r in rows)
+        total_ul_rate = sum(r.get("upload_rate", 0) for r in rows)
+        if hasattr(self, "speed_graph"):
+            self.speed_graph.push(total_dl_rate, total_ul_rate)
         # Update stats display
         stats = self.seed.stats
         if hasattr(self, "lib_stats_label"):
+            total_dl = stats.get("total_downloaded", 0)
+            total_ul = stats.get("total_uploaded", 0)
+            today = time.strftime("%Y-%m-%d")
+            daily = stats.get("daily", {})
+            today_dl = daily.get(today, {}).get("dl", 0)
+            today_ul = daily.get(today, {}).get("ul", 0)
             self.lib_stats_label.setText(
-                f"Всего скачано: {human_bytes(stats.get('total_downloaded', 0))} · "
-                f"отдано: {human_bytes(stats.get('total_uploaded', 0))}"
+                f"Всего: ↓{human_bytes(total_dl)} ↑{human_bytes(total_ul)} · "
+                f"Сегодня: ↓{human_bytes(today_dl)} ↑{human_bytes(today_ul)}"
             )
 
     def _check_pending_flash_copies(self, rows: list):

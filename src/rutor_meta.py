@@ -79,6 +79,25 @@ def _extract_poster(details_html: str, host: str) -> str:
     return ""
 
 
+def _extract_screenshots(details_html: str, host: str, poster_url: str) -> list[str]:
+    """Extract screenshot/preview URLs from the details table (excluding poster and UI assets)."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    if poster_url:
+        seen.add(poster_url)
+    for im in re.finditer(r'(?is)<img[^>]+src="([^"]+)"', details_html):
+        src = im.group(1)
+        if "cdnbunny.org" in src or src.endswith(".gif") or src.endswith(".png"):
+            continue
+        if "/i/" in src and ("rutor" in src or src.startswith("//")):
+            continue
+        url = _abs_url(src, host)
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
 def _extract_description(details_html: str) -> str:
     """Pull the main description blob from the first big <td> inside #details."""
     # Find the first row's second cell which holds the body of the description.
@@ -208,6 +227,7 @@ def fetch_torrent_details(url: str, timeout: int = 10) -> dict:
     """
     result = {
         "poster_url": "",
+        "screenshots": [],
         "description": "",
         "year": "",
         "files": [],
@@ -232,6 +252,7 @@ def fetch_torrent_details(url: str, timeout: int = 10) -> dict:
 
         title = _extract_title(page)
         result["poster_url"] = _extract_poster(details_html, host)
+        result["screenshots"] = _extract_screenshots(details_html, host, result["poster_url"])
         result["description"] = _extract_description(details_html)
         result["year"] = _extract_year(title, result["description"])
         result["category"] = _extract_category(details_html)
