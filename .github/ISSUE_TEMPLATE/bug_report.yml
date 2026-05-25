@@ -1,0 +1,48 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug — what did you expect vs what actually happened.
+      placeholder: "I clicked Download but nothing happened..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the issue.
+      placeholder: |
+        1. Search for "..."
+        2. Click on the first result
+        3. Press "Download → flash"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: TorFlash version
+      description: Check in Settings tab or run with --version.
+      placeholder: "1.7.0"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distro & desktop
+      placeholder: "Arch Linux, KDE Plasma 6.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output
+      description: Paste relevant lines from `~/.local/share/TorFlash/torflash.log`
+      render: text
