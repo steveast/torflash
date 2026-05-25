@@ -1,5 +1,10 @@
 # ⚡ TorFlash
 
+[![GitHub Release](https://img.shields.io/github/v/release/steveast/torflash)](https://github.com/steveast/torflash/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/steveast/torflash/build.yml)](https://github.com/steveast/torflash/actions)
+[![License: MIT](https://img.shields.io/github/license/steveast/torflash)](LICENSE)
+[![Downloads](https://img.shields.io/github/downloads/steveast/torflash/total)](https://github.com/steveast/torflash/releases)
+
 **[English](README.md)** · Русский
 
 > Поиск торрентов на [rutor.info](https://rutor.info), скачивание и автоматическое копирование на USB-флешку с разбиением больших файлов под FAT32.

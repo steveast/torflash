@@ -1,5 +1,10 @@
 # ⚡ TorFlash
 
+[![GitHub Release](https://img.shields.io/github/v/release/steveast/torflash)](https://github.com/steveast/torflash/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/steveast/torflash/build.yml)](https://github.com/steveast/torflash/actions)
+[![License: MIT](https://img.shields.io/github/license/steveast/torflash)](LICENSE)
+[![Downloads](https://img.shields.io/github/downloads/steveast/torflash/total)](https://github.com/steveast/torflash/releases)
+
 English · **[Русский](README.ru.md)**
 
 > Search torrents on [rutor.info](https://rutor.info), download and auto-copy them to a USB flash drive — splitting large files for FAT32 along the way.
