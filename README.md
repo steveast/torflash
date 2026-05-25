@@ -5,7 +5,7 @@ English · **[Русский](README.ru.md)**
 > Search torrents on [rutor.info](https://rutor.info), download and auto-copy them to a USB flash drive — splitting large files for FAT32 along the way.
 
 <p align="center">
-  <img src="screenshot.png" alt="TorFlash screenshot" width="800">
+  <img src="assets/screenshot.png" alt="TorFlash screenshot" width="800">
 </p>
 
 A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open KTorrent, wait, copy manually" dance.
@@ -13,17 +13,20 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
 ## Features
 
 ### Search
-- 🔍 **Mirror fallback** across `rutor.info`, `rutor.is`, `rutor.org`
+- 🔍 **Multi-source**: Rutor (mirror fallback), NoNaMe-Club, RuTracker (login + proxy)
 - 📂 **Category filter** — movies / series / cartoons / games / music / books / software / sport / etc.
 - 🕘 **Query history** with autocomplete
-- 🖼 **Poster + description** in the detail panel (parsed from the torrent page)
-- 🧲 **Magnet + .torrent** — fetches `.torrent` straight from rutor for instant metadata
+- 🖼 **Poster + screenshots** in the detail panel (parsed from the torrent page, click to enlarge)
+- 🧲 **Magnet + .torrent** — fetches `.torrent` straight from the source for instant metadata
+- 🔢 **Numeric sorting** — sort results by seeds, leeches or size correctly
 
 ### Library & seeding
 - 📚 **Persistent library**: everything stays in `~/Storage` and keeps seeding while the app is open
 - 🌱 **Seeding restored on startup** via `resume_data` + cached `.torrent` files
 - ⏯ **Pause / Resume / Re-check** per torrent, queue multiple downloads
 - 🎞 **Mediainfo** in detail panel (codec, resolution, audio tracks, duration) via `mediainfo` or `ffprobe`
+- 📈 **Live speed graph** — real-time download/upload chart
+- 📊 **Daily stats** — today's and all-time download/upload totals (90-day retention)
 
 ### Flash drive
 - 💾 **Auto-detect** USB at `/run/media/$USER/*`, copy to `Movies/`
@@ -39,7 +42,7 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
 - 📊 Inline progress in the same panel (blue — download, green — copy), no blocking modals
 - 🎨 **Theme**: auto / light / dark
 - 🚦 **Rate limits** (down / up KB/s) in settings
-- ⚙️ **Settings**: autostart at login, hidden start, minimize-to-tray on close
+- ⚙️ **Settings tab**: autostart at login, hidden start, minimize-to-tray, RuTracker credentials, proxy
 - 🔄 **Self-update** from GitHub Releases — manual + automatic daily check
 - 🔧 **CLI mode** for headless use: `torflash_cli.py search QUERY | list | download URL | remove HASH`
 
@@ -108,8 +111,8 @@ Uncheck "Mirror to flash" and everything just lands in `~/Storage`.
 - `DownloadWorker` — adds torrents to the shared session, watches progress, leaves them seeding when done
 - `CopyWorker` — streaming copy with MKV-aware splitting (mkvmerge) or fallback byte-split
 - `UpdateChecker` / `UpdateDownloader` — GitHub Releases API + `os.execv` self-restart after update
-- `SettingsDialog` — autostart (`~/.config/autostart/TorFlash.desktop`), hidden start, minimize-to-tray
-- `MainWindow` — `QTabWidget` (search + library tabs), split-views inside each
+- `providers/` — pluggable search providers: Rutor, NNM, RuTracker
+- `MainWindow` — `QTabWidget` (search + library + flash + settings), split-views inside each
 
 ## Logs
 
