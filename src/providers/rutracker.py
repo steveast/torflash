@@ -139,7 +139,7 @@ class RuTrackerProvider(Provider):
             raise RuntimeError(f"RuTracker login failed: {last_err}")
         raise RuntimeError("Не удалось войти в RuTracker — проверьте логин/пароль")
 
-    def search(self, query: str, category: int = 0, timeout: float = 10) -> list[dict]:
+    def search(self, query: str, category: int = 0, timeout: float = 10, proxy: str = "") -> list[dict]:
         if not self.configured:
             raise RuntimeError("RuTracker: не заданы логин/пароль (Настройки)")
         s = self._login(timeout)

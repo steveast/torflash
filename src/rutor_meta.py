@@ -194,7 +194,7 @@ def _fetch_files(session: requests.Session, host: str, tid: str, timeout: int) -
     return []
 
 
-def _try_get(url: str, timeout: int) -> tuple[str, str] | None:
+def _try_get(url: str, timeout: int, proxy: str = "") -> tuple[str, str] | None:
     """Try mirrors in order. Returns (host, html) or None."""
     parsed = urlparse(url if "://" in url else "https://" + url)
     path = parsed.path or "/"
@@ -208,6 +208,8 @@ def _try_get(url: str, timeout: int) -> tuple[str, str] | None:
             candidates.append(m)
 
     session = requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
     for host in candidates:
         target = urlunparse(("https", host, parsed.path or "/", "", parsed.query, ""))
         try:
@@ -220,7 +222,7 @@ def _try_get(url: str, timeout: int) -> tuple[str, str] | None:
     return None
 
 
-def fetch_torrent_details(url: str, timeout: int = 10) -> dict:
+def fetch_torrent_details(url: str, timeout: int = 10, proxy: str = "") -> dict:
     """Fetch a rutor torrent detail page and return parsed metadata.
 
     Always returns a dict with all expected keys, even on failure.
@@ -236,7 +238,7 @@ def fetch_torrent_details(url: str, timeout: int = 10) -> dict:
         "info_hash": "",
     }
     try:
-        got = _try_get(url, timeout)
+        got = _try_get(url, timeout, proxy)
     except Exception:
         got = None
     if not got:

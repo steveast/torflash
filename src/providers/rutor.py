@@ -88,15 +88,16 @@ class RutorProvider(Provider):
     display_name = "Rutor"
     categories = CATEGORIES
 
-    def search(self, query: str, category: int = 0, timeout: float = 10) -> list[dict]:
+    def search(self, query: str, category: int = 0, timeout: float = 10, proxy: str = "") -> list[dict]:
         last_err = None
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
         for base in MIRRORS:
             if category:
                 url = f"{base}/search/0/{category}/000/0/{quote(query)}"
             else:
                 url = f"{base}/search/{quote(query)}"
             try:
-                r = requests.get(url, headers=HEADERS, timeout=timeout)
+                r = requests.get(url, headers=HEADERS, timeout=timeout, proxies=proxies)
                 r.raise_for_status()
                 return _parse(r.text, base)
             except requests.RequestException as e:

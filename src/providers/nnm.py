@@ -88,12 +88,13 @@ class NnmProvider(Provider):
     name = "nnm"
     display_name = "NoNaMe-Club"
 
-    def search(self, query: str, category: int = 0, timeout: float = 10) -> list[dict]:
+    def search(self, query: str, category: int = 0, timeout: float = 10, proxy: str = "") -> list[dict]:
         params = {"nm": query}
         native = _RUTOR_TO_NNM_FORUM.get(category)
         if native:
             params["f"] = str(native)
         url = f"{BASE}/tracker.php"
-        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        proxies = {"http": proxy, "https": proxy} if proxy else {}
+        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout, proxies=proxies)
         r.raise_for_status()
         return _parse(r.text)

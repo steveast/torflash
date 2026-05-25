@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 GITHUB_REPO = "steveast/torflash"
 
 import faulthandler
@@ -47,6 +47,17 @@ EXTRA_TRACKERS = [
 ]
 
 SEARCH_HISTORY_MAX = 30
+
+# ---------------------------------------------------------------------------
+#  Global proxy (set from Settings tab, used by all network code)
+# ---------------------------------------------------------------------------
+_proxy: str = ""
+
+
+def _proxies() -> dict:
+    """Return requests-compatible proxies dict from the global proxy setting."""
+    return {"http": _proxy, "https": _proxy} if _proxy else {}
+
 
 # ---------------------------------------------------------------------------
 #  Internationalisation (i18n)
@@ -107,10 +118,12 @@ _EN: dict[str, str] = {
     " КБ/с": " KB/s",
     "Скачивание ↓:": "Download \u2193:",
     "Раздача ↑:": "Upload \u2191:",
+    "<b>Сеть</b>": "<b>Network</b>",
+    "socks5://127.0.0.1:1080 или http://proxy:8080": "socks5://127.0.0.1:1080 or http://proxy:8080",
+    "Используется для всех запросов (поиск, постеры, обновления)": "Used for all requests (search, posters, updates)",
     "<b>RuTracker</b> (требуется аккаунт):": "<b>RuTracker</b> (account required):",
     "логин на rutracker.org": "rutracker.org username",
     "пароль": "password",
-    "socks5://127.0.0.1:1080 или http://proxy:8080": "socks5://127.0.0.1:1080 or http://proxy:8080",
     "Логин:": "Username:",
     "Пароль:": "Password:",
     "Прокси:": "Proxy:",
@@ -212,6 +225,9 @@ _EN: dict[str, str] = {
     "Флешка извлечена ({}) — можно вынимать": "Flash drive ejected ({}) \u2014 safe to remove",
     "Утилита не найдена: {}": "Utility not found: {}",
     "Флешка безопасно извлечена": "Flash drive safely ejected",
+    "⏏ Синхронизация буферов…": "⏏ Syncing buffers…",
+    "⏏ Размонтирование…": "⏏ Unmounting…",
+    "⏏ Отключение питания устройства…": "⏏ Powering off device…",
     # -- flash tab status messages --
     "Ошибка чтения: {}": "Read error: {}",
     "Идёт загрузка — дождитесь завершения": "Download in progress \u2014 wait for it to finish",
@@ -601,7 +617,7 @@ class SeedSession:
             try:
                 r = requests.get(
                     torrent_url, headers=HEADERS, timeout=20,
-                    allow_redirects=True, cookies=cookies,
+                    allow_redirects=True, cookies=cookies, proxies=_proxies(),
                 )
                 r.raise_for_status()
                 torrent_bytes = r.content
@@ -1093,7 +1109,7 @@ class UpdateChecker(QThread):
             r = requests.get(
                 f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME},
-                timeout=10,
+                timeout=10, proxies=_proxies(),
             )
             r.raise_for_status()
             data = r.json()
@@ -1129,7 +1145,7 @@ class UpdateDownloader(QThread):
     def run(self):
         try:
             target = Path(self.target_dir) / "TorFlash.new"
-            r = requests.get(self.url, stream=True, timeout=60)
+            r = requests.get(self.url, stream=True, timeout=60, proxies=_proxies())
             r.raise_for_status()
             total = int(r.headers.get("content-length") or 0)
             written = 0
@@ -1169,7 +1185,7 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            results = self.provider.search(self.query, self.category)
+            results = self.provider.search(self.query, self.category, proxy=_proxy)
             self.done.emit(self.provider.name, results)
         except requests.RequestException as e:
             self.failed.emit(self.provider.name, str(e))
@@ -1208,7 +1224,7 @@ class MetaFetcher(QThread):
             print(f"[meta] rutor_meta module missing: {e}", flush=True)
             return
         try:
-            data = fetch_torrent_details(self.url)
+            data = fetch_torrent_details(self.url, proxy=_proxy)
             self.fetched.emit(self.url, data)
         except Exception as e:
             print(f"[meta] fetch failed: {e}", flush=True)
@@ -1231,7 +1247,7 @@ class PosterFetcher(QThread):
         last_err = None
         for attempt in range(2):
             try:
-                r = requests.get(self.url, headers=headers, timeout=10)
+                r = requests.get(self.url, headers=headers, timeout=10, proxies=_proxies())
                 r.raise_for_status()
                 if len(r.content) > 0:
                     self.loaded.emit(self.url, r.content)
@@ -1781,6 +1797,21 @@ class MainWindow(QMainWindow):
         rate_form.addRow(_t("Раздача ↑:"), self.sp_up)
         v.addLayout(rate_form)
 
+        # Сеть (глобальный прокси)
+        v.addWidget(QLabel(_t("<b>Сеть</b>")))
+        net_form = QFormLayout()
+        net_form.setHorizontalSpacing(10)
+        # Миграция: если есть старый ключ rutracker_proxy — берём из него
+        _saved_proxy = self.settings.value("proxy", "", type=str)
+        if not _saved_proxy:
+            _saved_proxy = self.settings.value("rutracker_proxy", "", type=str)
+        self.proxy_edit = QLineEdit(_saved_proxy)
+        self.proxy_edit.setPlaceholderText(_t("socks5://127.0.0.1:1080 или http://proxy:8080"))
+        self.proxy_edit.setToolTip(_t("Используется для всех запросов (поиск, постеры, обновления)"))
+        self.proxy_edit.editingFinished.connect(self._save_proxy)
+        net_form.addRow(_t("Прокси:"), self.proxy_edit)
+        v.addLayout(net_form)
+
         # RuTracker
         v.addWidget(QLabel(_t("<b>RuTracker</b> (требуется аккаунт):")))
         rt_form = QFormLayout()
@@ -1792,12 +1823,8 @@ class MainWindow(QMainWindow):
         self.rt_pass.setPlaceholderText(_t("пароль"))
         self.rt_pass.setEchoMode(QLineEdit.Password)
         self.rt_pass.editingFinished.connect(self._save_rt_credentials)
-        self.rt_proxy = QLineEdit(self.settings.value("rutracker_proxy", "", type=str))
-        self.rt_proxy.setPlaceholderText(_t("socks5://127.0.0.1:1080 или http://proxy:8080"))
-        self.rt_proxy.editingFinished.connect(self._save_rt_credentials)
         rt_form.addRow(_t("Логин:"), self.rt_user)
         rt_form.addRow(_t("Пароль:"), self.rt_pass)
-        rt_form.addRow(_t("Прокси:"), self.rt_proxy)
         v.addLayout(rt_form)
 
         info = QLabel(
@@ -2539,13 +2566,20 @@ class MainWindow(QMainWindow):
             apply_theme(QApplication.instance(), theme)
         except (ImportError, ModuleNotFoundError) as e:
             print(f"[main] theme module unavailable: {e}", flush=True)
+        # Глобальный прокси (миграция со старого ключа rutracker_proxy)
+        global _proxy
+        _proxy = self.settings.value("proxy", "", type=str)
+        if not _proxy:
+            _proxy = self.settings.value("rutracker_proxy", "", type=str)
+            if _proxy:
+                self.settings.setValue("proxy", _proxy)
         # RuTracker credentials
         rt = get_provider("rutracker")
         if rt and hasattr(rt, "set_credentials"):
             rt.set_credentials(
                 self.settings.value("rutracker_user", "", type=str),
                 self.settings.value("rutracker_pass", "", type=str),
-                self.settings.value("rutracker_proxy", "", type=str),
+                _proxy,
             )
 
     def _maybe_check_updates(self):
@@ -2766,7 +2800,7 @@ class MainWindow(QMainWindow):
         full_url = url.replace("/thumb/", "/big/")
         try:
             import requests
-            r = requests.get(full_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            r = requests.get(full_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, proxies=_proxies())
             if r.status_code == 200:
                 full_pix = QPixmap()
                 full_pix.loadFromData(r.content)
@@ -2823,16 +2857,27 @@ class MainWindow(QMainWindow):
         enabled = [n for n, cb in self.provider_checks.items() if cb.isChecked()]
         self.settings.setValue("enabled_providers", enabled)
 
+    def _save_proxy(self):
+        global _proxy
+        _proxy = self.proxy_edit.text().strip()
+        self.settings.setValue("proxy", _proxy)
+        # Обновляем прокси и для RuTracker-сессии
+        rt = get_provider("rutracker")
+        if rt and hasattr(rt, "set_credentials"):
+            rt.set_credentials(
+                self.settings.value("rutracker_user", "", type=str),
+                self.settings.value("rutracker_pass", "", type=str),
+                _proxy,
+            )
+
     def _save_rt_credentials(self):
         user = self.rt_user.text().strip()
         pwd = self.rt_pass.text()
-        proxy = self.rt_proxy.text().strip()
         self.settings.setValue("rutracker_user", user)
         self.settings.setValue("rutracker_pass", pwd)
-        self.settings.setValue("rutracker_proxy", proxy)
         rt = get_provider("rutracker")
         if rt and hasattr(rt, "set_credentials"):
-            rt.set_credentials(user, pwd, proxy)
+            rt.set_credentials(user, pwd, _proxy)
 
     def _enabled_providers(self) -> list:
         return [p for p in ALL_PROVIDERS if self.provider_checks[p.name].isChecked()]
@@ -3002,6 +3047,12 @@ class MainWindow(QMainWindow):
         if not mount:
             self._show_banner(_t("Флешка не смонтирована"))
             return
+
+        # Блокируем кнопки на время операции
+        self.eject_btn.setEnabled(False)
+        self.flash_eject_btn.setEnabled(False)
+        app = QApplication.instance()
+
         try:
             src = subprocess.run(
                 ["findmnt", "-no", "SOURCE", mount],
@@ -3015,8 +3066,13 @@ class MainWindow(QMainWindow):
             print(f"[eject] parent={parent}", flush=True)
 
             # Сначала syncим
+            self.statusBar().showMessage(_t("⏏ Синхронизация буферов…"))
+            app.processEvents()
             subprocess.run(["sync"], check=False)
 
+            # Размонтирование
+            self.statusBar().showMessage(_t("⏏ Размонтирование…"))
+            app.processEvents()
             unmount_res = subprocess.run(
                 ["udisksctl", "unmount", "-b", src],
                 capture_output=True, text=True,
@@ -3056,6 +3112,9 @@ class MainWindow(QMainWindow):
                 self._show_banner(msg)
                 return
 
+            # Power-off
+            self.statusBar().showMessage(_t("⏏ Отключение питания устройства…"))
+            app.processEvents()
             poff = subprocess.run(
                 ["udisksctl", "power-off", "-b", parent],
                 capture_output=True, text=True,
@@ -3091,6 +3150,9 @@ class MainWindow(QMainWindow):
         except subprocess.SubprocessError as e:
             print(f"[eject] subprocess error: {e}", flush=True)
             self._show_banner(_t("Ошибка: {}").format(e))
+        finally:
+            self.eject_btn.setEnabled(True)
+            self.flash_eject_btn.setEnabled(True)
 
     # ---------- actions ----------
 

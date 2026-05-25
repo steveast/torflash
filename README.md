@@ -13,12 +13,13 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
 ## Features
 
 ### Search
-- 🔍 **Multi-source**: Rutor (mirror fallback), NoNaMe-Club, RuTracker (login + proxy)
+- 🔍 **Multi-source**: Rutor (mirror fallback), NoNaMe-Club, RuTracker (login required)
 - 📂 **Category filter** — movies / series / cartoons / games / music / books / software / sport / etc.
 - 🕘 **Query history** with autocomplete
 - 🖼 **Poster + screenshots** in the detail panel (parsed from the torrent page, click to enlarge)
 - 🧲 **Magnet + .torrent** — fetches `.torrent` straight from the source for instant metadata
 - 🔢 **Numeric sorting** — sort results by seeds, leeches or size correctly
+- 🌐 **i18n** — Russian / English, language switcher in settings
 
 ### Library & seeding
 - 📚 **Persistent library**: everything stays in `~/Storage` and keeps seeding while the app is open
@@ -34,7 +35,7 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
   - **MKV** via `mkvmerge --split size:NM` — each part is a standalone playable MKV
   - Other formats — byte-split with the extension preserved (`name.part000.mkv`)
 - 📁 **Flash overview tab**: free space, listed contents, per-file delete, open in file manager
-- ⏏ **Safe eject** (`udisksctl unmount` + `power-off`); shows which process is holding the device if busy
+- ⏏ **Safe eject** (`udisksctl unmount` + `power-off`) with step-by-step status (sync → unmount → power-off); shows which process is holding the device if busy
 - 🔁 **Pending flash copy** survives restart — flag stored in `library.json`, auto-copies when the torrent finishes and the flash is back
 
 ### App & control
@@ -42,7 +43,8 @@ A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes ruto
 - 📊 Inline progress in the same panel (blue — download, green — copy), no blocking modals
 - 🎨 **Theme**: auto / light / dark
 - 🚦 **Rate limits** (down / up KB/s) in settings
-- ⚙️ **Settings tab**: autostart at login, hidden start, minimize-to-tray, RuTracker credentials, proxy
+- 🌍 **Global proxy** (SOCKS5 / HTTP) — applies to all network requests (search, posters, updates), configured in a dedicated Network section
+- ⚙️ **Settings tab**: autostart at login, hidden start, minimize-to-tray, RuTracker credentials
 - 🔄 **Self-update** from GitHub Releases — manual + automatic daily check
 - 🔧 **CLI mode** for headless use: `torflash_cli.py search QUERY | list | download URL | remove HASH`
 

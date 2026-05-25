@@ -20,5 +20,5 @@ class Provider:
     # Логические категории для combobox: list[(native_id, label)]. 0 = все.
     categories: list[tuple[int, str]] = [(0, "Все")]
 
-    def search(self, query: str, category: int = 0, timeout: float = 10) -> list[dict]:
+    def search(self, query: str, category: int = 0, timeout: float = 10, proxy: str = "") -> list[dict]:
         raise NotImplementedError
