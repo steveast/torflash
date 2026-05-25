@@ -13,23 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-libtorrent python3-pyqt5
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install test dependencies
-        run: |
-          python -m venv --system-site-packages .test-venv
-          .test-venv/bin/pip install pytest requests
+        run: pip install pytest requests
 
       - name: Run tests
-        run: .test-venv/bin/python -m pytest tests/ -v
+        run: python -m pytest tests/ -v
 
   build:
     needs: test
