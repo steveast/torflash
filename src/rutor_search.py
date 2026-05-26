@@ -348,7 +348,7 @@ def _t(text: str) -> str:
     return _EN.get(text, text)
 
 
-from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, QSharedMemory, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAction,
@@ -4127,6 +4127,22 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
+
+    # Запрет запуска более одного экземпляра
+    shared_mem = QSharedMemory("TorFlash_SingleInstance", app)
+    if not shared_mem.create(1):
+        # На Linux сегмент может остаться после краша — пробуем очистить
+        shared_mem.attach()
+        shared_mem.detach()
+        if not shared_mem.create(1):
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(None, APP_NAME, "TorFlash уже запущен.")
+            sys.exit(0)
+
+    # KDE Plasma 6 сохраняет шрифты в формате Qt6 — Qt5 не может их прочитать.
+    # Задаём шрифт явно, чтобы избежать QFont::fromString warnings и уродливых шрифтов.
+    app.setFont(QFont("Noto Sans", 10))
+
     app.setQuitOnLastWindowClosed(False)  # окно скрывается в трей — не выходим
     setup_icon_theme()
     icon_path = ASSETS_DIR / "torflash.svg"
