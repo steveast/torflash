@@ -2,6 +2,13 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.8.0] — 2026-05-26
+- Single-instance guard — prevents launching multiple copies
+- KDE Plasma 6 font fix — explicit Noto Sans to avoid Qt5/Qt6 format mismatch
+- Issue templates, GitHub Pages landing page
+- CI: tests in GitHub Actions, PyQt5 mocking for headless environments
+- AUR package, AppImage build, .desktop file, contributing guide
+
 ## [1.7.0] — 2026-05-25
 - Global proxy support for all providers
 - Eject status feedback (shows which process holds the device)

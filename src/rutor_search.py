@@ -2,7 +2,7 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 GITHUB_REPO = "steveast/torflash"
 
 import faulthandler
