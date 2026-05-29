@@ -535,6 +535,12 @@ class SeedSession:
         self._prev_session_ul = 0
         self.ses = lt.session({
             "listen_interfaces": "0.0.0.0:6881",
+            # libtorrent 2.0 по умолчанию мапит в память каждый файл крупнее
+            # mmap_file_size_cutoff*16КиБ (по умолчанию 40 = 640 КиБ). При
+            # сидировании это раздувает RSS на полный размер всех раздач (у нас
+            # доходило до 5+ ГБ). Поднимаем порог выше любого файла, чтобы диск
+            # шёл через обычные pread/pwrite + внутренний кэш (cache_size).
+            "mmap_file_size_cutoff": 2147483647,
             "alert_mask": (
                 lt.alert.category_t.error_notification
                 | lt.alert.category_t.status_notification
