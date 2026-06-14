@@ -72,16 +72,14 @@ jobs:
       - name: Sign artifacts (minisign)
         env:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           if [ -z "$MINISIGN_KEY" ]; then echo "MINISIGN_KEY не задан — подпись пропущена"; exit 0; fi
-          sudo apt-get install -y minisign
           printf '%s\n' "$MINISIGN_KEY" > /tmp/ms.key
-          cd dist
-          echo "$MINISIGN_PASSWORD" | minisign -S -s /tmp/ms.key -m TorFlash
-          echo "$MINISIGN_PASSWORD" | minisign -S -s /tmp/ms.key -m TorFlash-x86_64.AppImage
+          # Подписываем через Python+cryptography (minisign-бинаря нет в apt 22.04)
+          .build-venv/bin/python scripts/minisign_sign.py /tmp/ms.key \
+            dist/TorFlash dist/TorFlash-x86_64.AppImage
           rm -f /tmp/ms.key
-          ls -la *.minisig
+          ls -la dist/*.minisig
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
