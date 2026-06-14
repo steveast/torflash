@@ -17,12 +17,9 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rutor_search import (  # noqa: E402
-    EXTRA_TRACKERS,
-    HEADERS,
-    _safe_join,
-)
-from providers import get_provider  # noqa: E402
+from torflash.config import EXTRA_TRACKERS, HEADERS  # noqa: E402
+from torflash.helpers import _safe_join  # noqa: E402
+from torflash.providers import get_provider  # noqa: E402
 
 LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
 TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"

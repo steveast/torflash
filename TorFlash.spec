@@ -9,7 +9,19 @@ datas = [
     ('assets/torflash-tray-48.png', '.'),
 ]
 binaries = []
-hiddenimports = ['requests', 'rutor_meta', 'mediainfo', 'themes', 'providers', 'providers.rutor', 'providers.nnm', 'providers.rutracker', 'providers.base']
+hiddenimports = [
+    'requests',
+    'torflash', 'torflash.config', 'torflash.i18n', 'torflash.helpers',
+    'torflash.runtime', 'torflash.dl_slot', 'torflash.meta', 'torflash.mediainfo', 'torflash.themes',
+    'torflash.session', 'torflash.session.seed_session', 'torflash.session.download_worker',
+    'torflash.workers', 'torflash.workers.copy_worker', 'torflash.workers.search_worker',
+    'torflash.workers.meta_fetcher', 'torflash.workers.poster_fetcher',
+    'torflash.update', 'torflash.update.checker', 'torflash.update.downloader',
+    'torflash.widgets', 'torflash.widgets.speed_graph', 'torflash.widgets.sortable_item',
+    'torflash.ui', 'torflash.ui.main_window',
+    'torflash.providers', 'torflash.providers.base', 'torflash.providers.rutor',
+    'torflash.providers.nnm', 'torflash.providers.rutracker',
+]
 tmp_ret = collect_all('requests')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

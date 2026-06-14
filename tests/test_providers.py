@@ -14,7 +14,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 class TestRutorParser:
     def _parse(self):
-        from providers.rutor import _parse
+        from torflash.providers.rutor import _parse
         html = (FIXTURES / "rutor_search.html").read_text()
         return _parse(html, "https://rutor.info")
 
@@ -63,7 +63,7 @@ class TestRutorParser:
 
 class TestNnmParser:
     def _parse(self):
-        from providers.nnm import _parse
+        from torflash.providers.nnm import _parse
         html = (FIXTURES / "nnm_search.html").read_text()
         return _parse(html)
 
@@ -103,7 +103,7 @@ class TestNnmParser:
 class TestRutorMeta:
     def _fetch(self):
         import re
-        from rutor_meta import (
+        from torflash.meta import (
             _extract_poster, _extract_description, _extract_screenshots,
             _extract_year, _extract_magnet_and_hash, _extract_title,
         )
@@ -163,17 +163,17 @@ class TestRutorMeta:
 
 class TestSizeParser:
     def test_parse_gb(self):
-        from rutor_search import parse_size_text
+        from torflash.helpers import parse_size_text
         assert parse_size_text("1.5 GB") == int(1.5 * 1024**3)
 
     def test_parse_mb(self):
-        from rutor_search import parse_size_text
+        from torflash.helpers import parse_size_text
         assert parse_size_text("700 MB") == 700 * 1024**2
 
     def test_parse_empty(self):
-        from rutor_search import parse_size_text
+        from torflash.helpers import parse_size_text
         assert parse_size_text("") == 0
 
     def test_parse_comma(self):
-        from rutor_search import parse_size_text
+        from torflash.helpers import parse_size_text
         assert parse_size_text("1,5 GB") == int(1.5 * 1024**3)
