@@ -1435,7 +1435,17 @@ class MainWindow(QMainWindow):
         if r["page"]:
             self._meta_fetcher = MetaFetcher(r["page"])
             self._meta_fetcher.fetched.connect(self._on_meta_fetched)
-            self._meta_fetcher.start()
+            self._track_thread(self._meta_fetcher)
+
+    def _track_thread(self, t):
+        """Удерживаем ссылку на фоновый QThread до завершения и стартуем его.
+        Иначе перезапись self._meta_fetcher/_poster_fetcher роняет ещё
+        работающий поток в GC → ~QThread('Destroyed while running') → abort."""
+        if not hasattr(self, "_bg_threads"):
+            self._bg_threads = set()
+        self._bg_threads.add(t)
+        t.finished.connect(lambda: self._bg_threads.discard(t))
+        t.start()
 
     def _on_meta_fetched(self, url: str, data: dict):
         # Игнорируем если пользователь уже выбрал другой торрент
@@ -1449,7 +1459,7 @@ class MainWindow(QMainWindow):
         if poster_url:
             self._poster_fetcher = PosterFetcher(poster_url, referer=url)
             self._poster_fetcher.loaded.connect(self._on_poster_loaded)
-            self._poster_fetcher.start()
+            self._track_thread(self._poster_fetcher)
         # Скриншоты
         screenshots = data.get("screenshots") or []
         if screenshots:
@@ -1458,7 +1468,7 @@ class MainWindow(QMainWindow):
                 f = PosterFetcher(surl, referer=url)
                 f.loaded.connect(self._on_screenshot_loaded)
                 self._screenshot_fetchers.append(f)
-                f.start()
+                self._track_thread(f)
 
     def _on_poster_loaded(self, url: str, data: bytes):
         if not data:
