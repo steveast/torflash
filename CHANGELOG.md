@@ -2,6 +2,14 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.9.2] — 2026-06-14
+Security: signed releases.
+- Releases are now signed with minisign (Ed25519). The auto-updater verifies
+  the `.minisig` signature against the public key embedded in the app before
+  installing — a tampered or forged release (even one replacing the binary and
+  its SHA-256) is rejected. SHA-256 remains as the first check.
+- AUR PKGBUILD: pinned `sha256sums` (no more `SKIP`).
+
 ## [1.9.1] — 2026-06-14
 Bugfix release.
 - Fix crash when clicking through search results on a slow network — a
