@@ -7,7 +7,7 @@ from pathlib import Path
 APP_NAME = "TorFlash"
 
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 
 GITHUB_REPO = "steveast/torflash"

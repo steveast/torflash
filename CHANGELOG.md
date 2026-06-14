@@ -2,6 +2,19 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.9.1] — 2026-06-14
+Bugfix release.
+- Fix crash when clicking through search results on a slow network — a
+  background poster/metadata thread could be garbage-collected while still
+  running ("QThread: Destroyed while thread is still running" → abort). All
+  background fetchers are now held until they finish.
+- Fix "magnet sometimes doesn't copy": NNM/RuTracker listings carry no magnet
+  (it lives on the detail page) — copy now fetches it on demand and reports
+  honestly when unavailable, and writes both the clipboard and the X11 PRIMARY
+  selection.
+- Internal: source reorganized into a proper `torflash/` package (one class
+  per file); no behaviour change.
+
 ## [1.9.0] — 2026-06-14
 Security and stability release (post-review hardening).
 - Verified auto-update: the downloaded binary is now checked against the
