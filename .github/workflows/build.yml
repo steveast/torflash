@@ -67,21 +67,41 @@ jobs:
           sha256sum TorFlash-x86_64.AppImage > TorFlash-x86_64.AppImage.sha256
           cat TorFlash.sha256 TorFlash-x86_64.AppImage.sha256
 
+      # Подпись minisign активна только когда задан secret MINISIGN_KEY
+      # (приватный ключ). Без него шаг no-op — остаётся SHA-256.
+      - name: Sign artifacts (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "$MINISIGN_KEY" ]; then echo "MINISIGN_KEY не задан — подпись пропущена"; exit 0; fi
+          sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_KEY" > /tmp/ms.key
+          cd dist
+          echo "$MINISIGN_PASSWORD" | minisign -S -s /tmp/ms.key -m TorFlash
+          echo "$MINISIGN_PASSWORD" | minisign -S -s /tmp/ms.key -m TorFlash-x86_64.AppImage
+          rm -f /tmp/ms.key
+          ls -la *.minisig
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: TorFlash-linux-x86_64
+          if-no-files-found: ignore   # .minisig есть только когда настроена подпись
           path: |
             dist/TorFlash
             dist/TorFlash.sha256
+            dist/TorFlash.minisig
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: TorFlash-AppImage
+          if-no-files-found: ignore
           path: |
             dist/TorFlash-x86_64.AppImage
             dist/TorFlash-x86_64.AppImage.sha256
+            dist/TorFlash-x86_64.AppImage.minisig
 
   release:
     needs: [test, build]
@@ -110,5 +130,8 @@ jobs:
             TorFlash.sha256
             TorFlash-x86_64.AppImage
             TorFlash-x86_64.AppImage.sha256
+            TorFlash.minisig
+            TorFlash-x86_64.AppImage.minisig
+          fail_on_unmatched_files: false   # .minisig присутствуют только при настроенной подписи
           generate_release_notes: true
           draft: false

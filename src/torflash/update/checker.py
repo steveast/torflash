@@ -10,7 +10,7 @@ from torflash.helpers import _version_tuple
 
 
 class UpdateChecker(QThread):
-    found = pyqtSignal(str, str, str, str)  # version, asset_url, asset_name, sha256_url
+    found = pyqtSignal(str, str, str, str, str)  # version, asset_url, name, sha256_url, minisig_url
     up_to_date = pyqtSignal(str)        # current_version
     failed = pyqtSignal(str)
 
@@ -31,12 +31,13 @@ class UpdateChecker(QThread):
                 self.up_to_date.emit(APP_VERSION)
                 return
             assets = data.get("assets", [])
-            sha_by_name = {a.get("name", ""): a.get("browser_download_url", "") for a in assets}
+            url_by_name = {a.get("name", ""): a.get("browser_download_url", "") for a in assets}
             for asset in assets:
                 name = asset.get("name", "")
-                if name.startswith("TorFlash") and not name.endswith((".asc", ".sig", ".sha256")):
-                    sha_url = sha_by_name.get(name + ".sha256", "")
-                    self.found.emit(tag, asset["browser_download_url"], name, sha_url)
+                if name.startswith("TorFlash") and not name.endswith((".asc", ".sig", ".sha256", ".minisig")):
+                    sha_url = url_by_name.get(name + ".sha256", "")
+                    sig_url = url_by_name.get(name + ".minisig", "")
+                    self.found.emit(tag, asset["browser_download_url"], name, sha_url, sig_url)
                     return
             self.failed.emit(_t("Не найден бинарный asset в релизе"))
         except requests.RequestException as e:

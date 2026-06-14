@@ -13,6 +13,12 @@ APP_VERSION = "1.9.1"
 GITHUB_REPO = "steveast/torflash"
 
 
+# Публичный ключ minisign для проверки подписи обновлений (вторая строка .pub).
+# Пусто = проверка подписи выключена, работает только SHA-256. Заполнить, когда
+# сгенерируешь ключ (`minisign -G`) и добавишь приватный в repo secret MINISIGN_KEY.
+MINISIGN_PUBKEY = ""
+
+
 def _assets_dir() -> Path:
     """Папка с иконками и ресурсами. PyInstaller кладёт --add-data в _MEIPASS,
     при запуске из исходников — ../assets относительно src/."""

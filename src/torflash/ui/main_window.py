@@ -2653,8 +2653,9 @@ class MainWindow(QMainWindow):
         self.update_checker.failed.connect(self._on_update_check_failed)
         self.update_checker.start()
 
-    def _on_update_found(self, version: str, url: str, asset_name: str, sha256_url: str = ""):
-        self._pending_update = (version, url, asset_name, sha256_url)
+    def _on_update_found(self, version: str, url: str, asset_name: str,
+                         sha256_url: str = "", minisig_url: str = ""):
+        self._pending_update = (version, url, asset_name, sha256_url, minisig_url)
         self._show_banner(
             _t("Доступна версия v{} (сейчас v{}). Нажмите ⏏ для обновления → автозамена бинарника и перезапуск.").format(version, APP_VERSION),
             kind="info",
@@ -2683,9 +2684,9 @@ class MainWindow(QMainWindow):
                 _t("Запущена python-версия — обновление возможно только для бинарника. Запустите через ярлык TorFlash и попробуйте снова.")
             )
             return
-        version, url, _, sha256_url = self._pending_update
+        version, url, _, sha256_url, minisig_url = self._pending_update
         binary_dir = str(Path(sys.executable).parent)
-        self._update_dl = UpdateDownloader(url, binary_dir, sha256_url)
+        self._update_dl = UpdateDownloader(url, binary_dir, sha256_url, minisig_url)
         self._updating = True
         self.progress_phase.setText(_t("Обновление до v{}").format(version))
         self.progress_bar.setValue(0)

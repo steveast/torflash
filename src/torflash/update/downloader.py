@@ -8,9 +8,10 @@ import requests
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from torflash.config import _proxies
+from torflash.config import MINISIGN_PUBKEY, _proxies
 from torflash.i18n import _t
 from torflash.helpers import human_bytes, _sha256_from_sumfile
+from torflash.update.signature import verify_minisign
 
 
 class UpdateDownloader(QThread):
@@ -18,11 +19,12 @@ class UpdateDownloader(QThread):
     done = pyqtSignal(str)              # путь к новому бинарнику (.new)
     failed = pyqtSignal(str)
 
-    def __init__(self, url: str, target_dir: str, sha256_url: str = ""):
+    def __init__(self, url: str, target_dir: str, sha256_url: str = "", minisig_url: str = ""):
         super().__init__()
         self.url = url
         self.target_dir = target_dir
         self.sha256_url = sha256_url
+        self.minisig_url = minisig_url
 
     def run(self):
         try:
@@ -69,6 +71,31 @@ class UpdateDownloader(QThread):
                     "Установка отменена."
                 ))
                 return
+
+            # Асимметричная подпись (если включён публичный ключ): защищает даже
+            # от компрометации релиза — sha256 рядом с бинарником подменить можно,
+            # подпись без приватного ключа — нет. Включается при заполнении
+            # MINISIGN_PUBKEY; пусто = остаёмся на одной SHA-256.
+            if MINISIGN_PUBKEY:
+                if not self.minisig_url:
+                    target.unlink(missing_ok=True)
+                    self.failed.emit(_t("Нет подписи (.minisig) в релизе — установка отменена."))
+                    return
+                try:
+                    msr = requests.get(self.minisig_url, timeout=20, proxies=_proxies())
+                    msr.raise_for_status()
+                except requests.RequestException as e:
+                    target.unlink(missing_ok=True)
+                    self.failed.emit(_t("Не удалось скачать подпись: {}").format(e))
+                    return
+                if not verify_minisign(target.read_bytes(), msr.text, MINISIGN_PUBKEY):
+                    target.unlink(missing_ok=True)
+                    self.failed.emit(_t(
+                        "Подпись неверна — файл подменён или ключ не совпал. "
+                        "Установка отменена."
+                    ))
+                    return
+
             target.chmod(0o755)
             self.done.emit(str(target))
         except requests.RequestException as e:
