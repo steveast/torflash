@@ -13,7 +13,6 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 
@@ -21,9 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rutor_search import (  # noqa: E402
     EXTRA_TRACKERS,
     HEADERS,
-    MIRRORS,
-    parse,
+    _safe_join,
 )
+from providers import get_provider  # noqa: E402
 
 LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
 TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"
@@ -53,7 +52,9 @@ def load_library() -> dict:
 
 def save_library(lib: dict) -> None:
     LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-    LIBRARY_FILE.write_text(json.dumps(lib, ensure_ascii=False, indent=2))
+    tmp = LIBRARY_FILE.with_name(LIBRARY_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(lib, ensure_ascii=False, indent=2))
+    os.replace(tmp, LIBRARY_FILE)
 
 
 def truncate(s: str, n: int) -> str:
@@ -85,19 +86,17 @@ def print_table(headers: list[str], rows: list[list[str]]) -> None:
 # ---------- search ----------
 
 def cmd_search(args: argparse.Namespace) -> int:
-    last_err, results = "", []
-    for base in MIRRORS:
-        try:
-            r = requests.get(f"{base}/search/{quote(args.query)}",
-                             headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            results = parse(r.text, base)
-            if results:
-                break
-        except requests.RequestException as e:
-            last_err = f"{base}: {e}"
+    prov = get_provider("rutor")
+    if prov is None:
+        print("rutor provider unavailable", file=sys.stderr)
+        return 1
+    try:
+        results = prov.search(args.query, 0)
+    except requests.RequestException as e:
+        print(f"No results. {e}", file=sys.stderr)
+        return 1
     if not results:
-        print(f"No results. {last_err}", file=sys.stderr)
+        print("No results.", file=sys.stderr)
         return 1
     rows = [[it.get("date", ""), truncate(it.get("title", ""), 70),
              it.get("size", ""), it.get("seeds", "0"), it.get("leech", "0"),
@@ -286,8 +285,11 @@ def cmd_remove(args: argparse.Namespace) -> int:
     save_library(lib)
     print(f"Removed {key} from library.")
     if args.delete_files:
-        target = Path(meta.get("save_path", "")) / meta.get("title", "")
-        if target.exists():
+        save_path = meta.get("save_path", "")
+        target = _safe_join(save_path, meta.get("title", "")) if save_path else None
+        if target is None:
+            print("Refusing to delete: unsafe path", file=sys.stderr)
+        elif target.exists():
             if target.is_dir():
                 shutil.rmtree(target, ignore_errors=True)
             else:

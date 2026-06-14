@@ -2,6 +2,24 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.9.0] — 2026-06-14
+Security and stability release (post-review hardening).
+- Verified auto-update: the downloaded binary is now checked against the
+  release SHA-256 before install; mismatch or missing checksum aborts the
+  update (CI publishes `.sha256` for the binary and AppImage)
+- Path-traversal protection: malicious torrent file names can no longer write
+  or delete outside the target folder (copy-to-flash, library remove, CLI)
+- Thread-safe seeding session — shared library/handles/stats guarded by a lock
+- Atomic `library.json` / `stats.json` writes (temp file + rename) — no more
+  corrupted state on crash or full disk
+- Clean shutdown waits for in-flight downloads/copies; quitting mid-download no
+  longer leaves half-written files or deletes partial downloads
+- Safe eject hardening: subprocess timeouts (no UI hang), correct parent-device
+  resolution for NVMe/eMMC, re-entrancy guard
+- RuTracker credentials file restricted to 0600
+- Fixed the headless CLI (`torflash_cli.py`), broken by the multi-provider refactor
+- Expanded test suite (28 → 51 tests)
+
 ## [1.8.0] — 2026-05-26
 - Single-instance guard — prevents launching multiple copies
 - KDE Plasma 6 font fix — explicit Noto Sans to avoid Qt5/Qt6 format mismatch

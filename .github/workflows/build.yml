@@ -60,17 +60,28 @@ jobs:
       - name: Build AppImage
         run: bash scripts/build-appimage.sh
 
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum TorFlash > TorFlash.sha256
+          sha256sum TorFlash-x86_64.AppImage > TorFlash-x86_64.AppImage.sha256
+          cat TorFlash.sha256 TorFlash-x86_64.AppImage.sha256
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: TorFlash-linux-x86_64
-          path: dist/TorFlash
+          path: |
+            dist/TorFlash
+            dist/TorFlash.sha256
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: TorFlash-AppImage
-          path: dist/TorFlash-x86_64.AppImage
+          path: |
+            dist/TorFlash-x86_64.AppImage
+            dist/TorFlash-x86_64.AppImage.sha256
 
   release:
     needs: [test, build]
@@ -96,6 +107,8 @@ jobs:
         with:
           files: |
             TorFlash
+            TorFlash.sha256
             TorFlash-x86_64.AppImage
+            TorFlash-x86_64.AppImage.sha256
           generate_release_notes: true
           draft: false

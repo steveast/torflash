@@ -2,10 +2,12 @@
 """TorFlash — поиск торрентов rutor.info и закачка на флешку с разбиением для FAT32."""
 
 APP_NAME = "TorFlash"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 GITHUB_REPO = "steveast/torflash"
 
 import faulthandler
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -466,11 +468,37 @@ def _result_id(r: dict) -> str:
     return f'{r.get("provider","")}::{r.get("page","") or r.get("torrent_url","")}'
 
 
-def detect_flash_mount() -> str | None:
-    base = Path(f"/run/media/{os.getlogin()}")
-    if not base.exists():
+def _current_user() -> str:
+    """Имя пользователя без os.getlogin() — тот падает с OSError без управляющего
+    терминала (автозапуск/systemd)."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if user:
+        return user
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, ImportError, AttributeError):
+        return ""
+
+
+def _safe_join(root, rel) -> "Path | None":
+    """Безопасно склеивает root/rel. Возвращает None, если результат (после
+    разворачивания ../ и симлинков) выходит за пределы root. Защита от
+    path traversal через имена файлов из недоверенных торрентов."""
+    root_p = Path(root).resolve()
+    dst = (root_p / rel).resolve()
+    try:
+        dst.relative_to(root_p)
+    except ValueError:
         return None
-    for child in base.iterdir():
+    return dst
+
+
+def detect_flash_mount(base: "str | None" = None) -> str | None:
+    base_path = Path(base) if base is not None else Path(f"/run/media/{_current_user()}")
+    if not base_path.exists():
+        return None
+    for child in base_path.iterdir():
         if child.is_dir() and os.access(child, os.W_OK):
             return str(child)
     return None
@@ -487,6 +515,12 @@ PART_SUFFIX_RE = re.compile(r"(-\d{3}|\.part\d{3}|\.\d{1,2})$")
 
 def _strip_part_suffix(stem: str) -> str:
     return PART_SUFFIX_RE.sub("", stem)
+
+
+def _split_copy_part_name(stem: str, ext: str, idx: int) -> str:
+    """Имя части raw-сплита: name.part000.mkv (расширение в конце, чтобы части
+    группировались обратно через _strip_part_suffix)."""
+    return f"{stem}.part{idx:03d}{ext}"
 
 
 def group_movie_parts(files: list[tuple[Path, int, float]]) -> list[dict]:
@@ -526,6 +560,9 @@ class SeedSession:
     def __init__(self):
         import libtorrent as lt
         self.lt = lt
+        # Реентрантный лок: handles/library/stats читаются UI-таймерами и
+        # одновременно мутируются из DownloadWorker-потока.
+        self._lock = threading.RLock()
         LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
         TORRENTS_CACHE_DIR.mkdir(exist_ok=True)
         RESUME_DIR.mkdir(exist_ok=True)
@@ -573,13 +610,49 @@ class SeedSession:
                 return {}
         return {}
 
+    @staticmethod
+    def _atomic_write(path: Path, text: str):
+        """Запись через временный файл + os.replace — иначе крах/полный диск
+        посреди write_text оставляет обрезанный JSON и теряет всю библиотеку."""
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+
     def _save_library(self):
         try:
-            LIBRARY_FILE.write_text(
-                json.dumps(self.library, ensure_ascii=False, indent=2)
-            )
+            with self._lock:
+                data = json.dumps(self.library, ensure_ascii=False, indent=2)
+            self._atomic_write(LIBRARY_FILE, data)
         except OSError as e:
             print(f"[seed] failed to save library: {e}", flush=True)
+
+    def set_pending_flash(self, info_hash: str, value: bool = True):
+        with self._lock:
+            changed = info_hash in self.library
+            if changed:
+                self.library[info_hash]["pending_flash_copy"] = value
+        if changed:
+            self._save_library()
+
+    def clear_pending_flash(self, info_hash: str):
+        with self._lock:
+            changed = info_hash in self.library and "pending_flash_copy" in self.library[info_hash]
+            if changed:
+                self.library[info_hash].pop("pending_flash_copy", None)
+        if changed:
+            self._save_library()
+
+    def mark_completed(self, info_hash: str):
+        with self._lock:
+            changed = info_hash in self.library
+            if changed:
+                self.library[info_hash]["completed_at"] = time.time()
+        if changed:
+            self._save_library()
+
+    def get_handle(self, info_hash: str):
+        with self._lock:
+            return self.handles.get(info_hash)
 
     def _hash_str(self, handle) -> str:
         try:
@@ -640,18 +713,21 @@ class SeedSession:
         handle = self.ses.add_torrent(params)
         handle.force_dht_announce()
         info_hash = self._hash_str(handle)
-        self.handles[info_hash] = handle
-        if info_hash not in self.library:
-            self.library[info_hash] = {
-                "hash": info_hash,
-                "title": params.ti.name() if params.ti else _t("(получение метаданных…)"),
-                "size": params.ti.total_size() if params.ti else 0,
-                "magnet": magnet,
-                "torrent_url": torrent_url,
-                "save_path": save_path,
-                "added_at": time.time(),
-                "completed_at": None,
-            }
+        with self._lock:
+            self.handles[info_hash] = handle
+            is_new = info_hash not in self.library
+            if is_new:
+                self.library[info_hash] = {
+                    "hash": info_hash,
+                    "title": params.ti.name() if params.ti else _t("(получение метаданных…)"),
+                    "size": params.ti.total_size() if params.ti else 0,
+                    "magnet": magnet,
+                    "torrent_url": torrent_url,
+                    "save_path": save_path,
+                    "added_at": time.time(),
+                    "completed_at": None,
+                }
+        if is_new:
             if torrent_bytes:
                 try:
                     (TORRENTS_CACHE_DIR / f"{info_hash}.torrent").write_bytes(torrent_bytes)
@@ -661,56 +737,64 @@ class SeedSession:
         return info_hash
 
     def update_metadata(self, info_hash: str):
-        h = self.handles.get(info_hash)
+        h = self.get_handle(info_hash)
         if not h or not h.status().has_metadata:
             return
         info = h.torrent_file()
-        if info_hash in self.library:
-            self.library[info_hash]["title"] = info.name()
-            self.library[info_hash]["size"] = info.total_size()
+        with self._lock:
+            present = info_hash in self.library
+            if present:
+                self.library[info_hash]["title"] = info.name()
+                self.library[info_hash]["size"] = info.total_size()
+        if present:
             tfile = TORRENTS_CACHE_DIR / f"{info_hash}.torrent"
             if not tfile.exists():
                 try:
                     ct = self.lt.create_torrent(info)
                     tfile.write_bytes(self.lt.bencode(ct.generate()))
-                except Exception as e:
+                except (RuntimeError, OSError) as e:
                     print(f"[seed] dump .torrent failed: {e}", flush=True)
             self._save_library()
 
     def remove(self, info_hash: str, delete_files: bool = False):
-        h = self.handles.pop(info_hash, None)
+        with self._lock:
+            h = self.handles.pop(info_hash, None)
+            meta = self.library.pop(info_hash, None)
         if h:
             try:
                 self.ses.remove_torrent(h, 1 if delete_files else 0)
             except RuntimeError:
                 pass
-        meta = self.library.pop(info_hash, None)
         if delete_files and meta:
             # libtorrent's option=1 удалит payload. На всякий — подчистим пустую папку.
-            save_path = Path(meta.get("save_path", STORAGE_DEFAULT))
+            save_path = meta.get("save_path", str(STORAGE_DEFAULT))
             tfile = TORRENTS_CACHE_DIR / f"{info_hash}.torrent"
             if tfile.exists():
                 try:
                     ti = self.lt.torrent_info(self.lt.bdecode(tfile.read_bytes()))
-                    name = ti.name()
-                    target = save_path / name
-                    if target.exists():
+                    # ti.name() из недоверенного .torrent — проверяем containment,
+                    # чтобы вредоносное имя ("../../..") не увело rmtree из save_path.
+                    target = _safe_join(save_path, ti.name())
+                    if target and target.exists():
                         if target.is_dir():
                             shutil.rmtree(target, ignore_errors=True)
                         else:
                             target.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                    elif target is None:
+                        print(f"[seed] refusing unsafe delete for {info_hash[:8]}", flush=True)
+                except (RuntimeError, OSError, ValueError) as e:
+                    print(f"[seed] cleanup failed for {info_hash[:8]}: {e}", flush=True)
         (TORRENTS_CACHE_DIR / f"{info_hash}.torrent").unlink(missing_ok=True)
         (RESUME_DIR / f"{info_hash}.dat").unlink(missing_ok=True)
         self._save_library()
 
     def get_status(self, info_hash: str):
-        h = self.handles.get(info_hash)
+        with self._lock:
+            h = self.handles.get(info_hash)
+            meta = dict(self.library.get(info_hash, {}))
         if not h:
             return None
         s = h.status()
-        meta = self.library.get(info_hash, {})
         return {
             "hash": info_hash,
             "title": meta.get("title", "?"),
@@ -732,7 +816,9 @@ class SeedSession:
         }
 
     def all_statuses(self) -> list:
-        return [s for s in (self.get_status(h) for h in list(self.handles)) if s]
+        with self._lock:
+            hids = list(self.handles)
+        return [s for s in (self.get_status(h) for h in hids) if s]
 
     def drain_alerts(self):
         for a in self.ses.pop_alerts():
@@ -741,7 +827,7 @@ class SeedSession:
                     hid = self._hash_str(a.handle)
                     buf = self.lt.write_resume_data_buf(a.params)
                     (RESUME_DIR / f"{hid}.dat").write_bytes(buf)
-                except Exception as e:
+                except (RuntimeError, OSError) as e:
                     print(f"[seed] write resume failed: {e}", flush=True)
             else:
                 msg = a.message()
@@ -750,7 +836,9 @@ class SeedSession:
                     print(f"[seed][alert] {type(a).__name__}: {msg}", flush=True)
 
     def request_save_resume_all(self):
-        for h in list(self.handles.values()):
+        with self._lock:
+            handles = list(self.handles.values())
+        for h in handles:
             if h.is_valid() and h.status().has_metadata:
                 h.save_resume_data()
 
@@ -779,26 +867,30 @@ class SeedSession:
 
     def _save_stats(self):
         try:
-            STATS_FILE.write_text(json.dumps(self.stats, indent=2))
+            with self._lock:
+                data = json.dumps(self.stats, indent=2)
+            self._atomic_write(STATS_FILE, data)
         except OSError:
             pass
 
     def update_stats(self):
         """Call periodically to accumulate session stats."""
+        with self._lock:
+            handles = list(self.handles.values())
         dl = 0
         ul = 0
-        for h in list(self.handles.values()):
+        for h in handles:
             if h.is_valid():
                 s = h.status()
                 dl += s.total_payload_download
                 ul += s.total_payload_upload
-        prev_dl = self._prev_session_dl
-        prev_ul = self._prev_session_ul
-        delta_dl = max(0, dl - prev_dl)
-        delta_ul = max(0, ul - prev_ul)
-        self._prev_session_dl = dl
-        self._prev_session_ul = ul
-        if delta_dl > 0 or delta_ul > 0:
+        with self._lock:
+            delta_dl = max(0, dl - self._prev_session_dl)
+            delta_ul = max(0, ul - self._prev_session_ul)
+            self._prev_session_dl = dl
+            self._prev_session_ul = ul
+            if delta_dl <= 0 and delta_ul <= 0:
+                return
             self.stats["total_downloaded"] += delta_dl
             self.stats["total_uploaded"] += delta_ul
             # Дневная статистика
@@ -811,7 +903,7 @@ class SeedSession:
             if len(daily) > 90:
                 for old_key in sorted(daily.keys())[:-90]:
                     del daily[old_key]
-            self._save_stats()
+        self._save_stats()
 
     def shutdown(self):
         self.update_stats()
@@ -838,25 +930,37 @@ class DownloadWorker(QThread):
         self.mark_pending_flash = mark_pending_flash
         self.cookies = cookies
         self._cancel = False
+        self._stop = False
         self.info_hash = ""
 
     def cancel(self):
+        """Отмена пользователем — удаляет частичную закачку."""
         self._cancel = True
+
+    def stop(self):
+        """Мягкая остановка при выходе из приложения — НЕ удаляет файлы,
+        торрент остаётся в сессии и доскачается при следующем запуске."""
+        self._stop = True
 
     def run(self):
         try:
             print(f"[DL] start save_dir={self.save_dir}", flush=True)
             self.info_hash = self.seed.add(self.magnet, self.torrent_url, self.save_dir,
                                            cookies=self.cookies)
-            handle = self.seed.handles[self.info_hash]
-            if self.mark_pending_flash and self.info_hash in self.seed.library:
-                self.seed.library[self.info_hash]["pending_flash_copy"] = True
-                self.seed._save_library()
+            handle = self.seed.get_handle(self.info_hash)
+            if handle is None:
+                self.failed.emit(_t("Ошибка: торрент не добавлен"))
+                return
+            if self.mark_pending_flash:
+                self.seed.set_pending_flash(self.info_hash, True)
             print(f"[DL] hash={self.info_hash[:8]} pending_flash={self.mark_pending_flash}", flush=True)
 
             self.progress.emit(0, _t("Получение метаданных…"))
             meta_deadline = time.monotonic() + 180
             while not handle.status().has_metadata:
+                if self._stop:
+                    print("[DL] stop requested — leaving torrent in session", flush=True)
+                    return
                 if self._cancel:
                     self.seed.remove(self.info_hash, delete_files=True)
                     self.failed.emit(_t("Отменено"))
@@ -881,6 +985,9 @@ class DownloadWorker(QThread):
             dl_start = time.monotonic()
             tick = 0
             while True:
+                if self._stop:
+                    print("[DL] stop requested — leaving torrent in session", flush=True)
+                    return
                 if self._cancel:
                     self.seed.remove(self.info_hash, delete_files=True)
                     self.failed.emit(_t("Отменено"))
@@ -907,9 +1014,7 @@ class DownloadWorker(QThread):
                 tick += 1
 
             print("[DL] complete, kept in seed session", flush=True)
-            if self.info_hash in self.seed.library:
-                self.seed.library[self.info_hash]["completed_at"] = time.time()
-                self.seed._save_library()
+            self.seed.mark_completed(self.info_hash)
             self.done.emit(self.save_dir, rel_paths, self.info_hash)
         except Exception as e:
             print(f"[DL] FAILED save_dir={self.save_dir} hash={self.info_hash[:8] if self.info_hash else '-'}\n{traceback.format_exc()}", flush=True)
@@ -958,7 +1063,12 @@ class CopyWorker(QThread):
             has_mkvmerge = shutil.which("mkvmerge") is not None
             for src in sources:
                 rel = src.relative_to(self.src_dir)
-                dst = Path(self.dst_dir) / rel
+                # Имена из недоверенного .torrent: не даём rel с ../ вырваться
+                # за пределы целевой папки (перезапись чужих файлов).
+                dst = _safe_join(self.dst_dir, rel)
+                if dst is None:
+                    report.append(f"⚠ {rel} — {_t('небезопасный путь, пропущено')}")
+                    continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 size = src.stat().st_size
                 # Incremental: skip files already on destination with same size
@@ -1066,7 +1176,7 @@ class CopyWorker(QThread):
             while True:
                 if self._cancel:
                     return part_idx
-                part_name = f"{stem}.part{part_idx:03d}{ext}"
+                part_name = _split_copy_part_name(stem, ext, part_idx)
                 part_path = dst.with_name(part_name)
                 written = 0
                 with open(part_path, "wb") as fout:
@@ -1105,8 +1215,15 @@ def _version_tuple(v: str) -> tuple:
     return tuple(parts)
 
 
+def _sha256_from_sumfile(text: str) -> str:
+    """Парсит файл формата `sha256sum`: «<hex>  <имя>». Возвращает hex в
+    нижнем регистре либо «» если строка не похожа на sha256."""
+    token = (text or "").strip().split()
+    return token[0].lower() if token and len(token[0]) == 64 else ""
+
+
 class UpdateChecker(QThread):
-    found = pyqtSignal(str, str, str)   # version, asset_url, asset_name
+    found = pyqtSignal(str, str, str, str)  # version, asset_url, asset_name, sha256_url
     up_to_date = pyqtSignal(str)        # current_version
     failed = pyqtSignal(str)
 
@@ -1126,10 +1243,13 @@ class UpdateChecker(QThread):
             if _version_tuple(tag) <= _version_tuple(APP_VERSION):
                 self.up_to_date.emit(APP_VERSION)
                 return
-            for asset in data.get("assets", []):
+            assets = data.get("assets", [])
+            sha_by_name = {a.get("name", ""): a.get("browser_download_url", "") for a in assets}
+            for asset in assets:
                 name = asset.get("name", "")
                 if name.startswith("TorFlash") and not name.endswith((".asc", ".sig", ".sha256")):
-                    self.found.emit(tag, asset["browser_download_url"], name)
+                    sha_url = sha_by_name.get(name + ".sha256", "")
+                    self.found.emit(tag, asset["browser_download_url"], name, sha_url)
                     return
             self.failed.emit(_t("Не найден бинарный asset в релизе"))
         except requests.RequestException as e:
@@ -1143,22 +1263,41 @@ class UpdateDownloader(QThread):
     done = pyqtSignal(str)              # путь к новому бинарнику (.new)
     failed = pyqtSignal(str)
 
-    def __init__(self, url: str, target_dir: str):
+    def __init__(self, url: str, target_dir: str, sha256_url: str = ""):
         super().__init__()
         self.url = url
         self.target_dir = target_dir
+        self.sha256_url = sha256_url
 
     def run(self):
         try:
+            # Целостность обязательна: качаем ожидаемый хэш ДО бинарника.
+            # Без него ставить нельзя — иначе подменённый apt/CDN/прокси бинарник
+            # будет запущен с правами пользователя (RCE).
+            if not self.sha256_url:
+                self.failed.emit(_t(
+                    "В релизе нет контрольной суммы (.sha256) — установка "
+                    "отменена. Обновитесь вручную с GitHub."
+                ))
+                return
+            sr = requests.get(self.sha256_url, timeout=20, proxies=_proxies())
+            sr.raise_for_status()
+            expected = _sha256_from_sumfile(sr.text)
+            if not expected:
+                self.failed.emit(_t("Не удалось прочитать контрольную сумму релиза"))
+                return
+
             target = Path(self.target_dir) / "TorFlash.new"
             r = requests.get(self.url, stream=True, timeout=60, proxies=_proxies())
             r.raise_for_status()
             total = int(r.headers.get("content-length") or 0)
             written = 0
+            digest = hashlib.sha256()
             with open(target, "wb") as f:
                 for chunk in r.iter_content(chunk_size=128 * 1024):
                     if chunk:
                         f.write(chunk)
+                        digest.update(chunk)
                         written += len(chunk)
                         pct = int(written * 100 / total) if total else 0
                         self.progress.emit(
@@ -1168,6 +1307,13 @@ class UpdateDownloader(QThread):
                                 + (f"/{human_bytes(total)}" if total else "")
                             ),
                         )
+            if not hmac.compare_digest(digest.hexdigest(), expected):
+                target.unlink(missing_ok=True)
+                self.failed.emit(_t(
+                    "Контрольная сумма не совпала — файл повреждён или подменён. "
+                    "Установка отменена."
+                ))
+                return
             target.chmod(0o755)
             self.done.emit(str(target))
         except requests.RequestException as e:
@@ -1391,6 +1537,7 @@ class MainWindow(QMainWindow):
             self.dst_dir = str(Path.home() / "Storage")
             self._initial_use_flash = False
         self.settings = QSettings("TorFlash", "TorFlash")
+        self._restrict_settings_perms()
         global _LANG
         _LANG = self.settings.value("language", "ru", type=str)
         self.seed = SeedSession()
@@ -2125,10 +2272,7 @@ class MainWindow(QMainWindow):
             self._show_banner(_t("Флешка не смонтирована"))
             return
         try:
-            src = subprocess.run(
-                ["findmnt", "-no", "SOURCE", mount],
-                capture_output=True, text=True, check=True, timeout=5,
-            ).stdout.strip()
+            src = self._mount_device(mount)
         except (subprocess.SubprocessError, FileNotFoundError) as e:
             self._show_banner(f"findmnt: {e}")
             return
@@ -2349,6 +2493,9 @@ class MainWindow(QMainWindow):
 
         self.title_label = QLabel()
         self.title_label.setWordWrap(True)
+        # Заголовок — недоверенный текст с трекера: рендерим буквально,
+        # чтобы остаточная разметка не интерпретировалась как rich-text.
+        self.title_label.setTextFormat(Qt.PlainText)
         self.title_label.setObjectName("titleLabel")
         title_font = QFont()
         title_font.setPointSize(13)
@@ -2881,9 +3028,22 @@ class MainWindow(QMainWindow):
         pwd = self.rt_pass.text()
         self.settings.setValue("rutracker_user", user)
         self.settings.setValue("rutracker_pass", pwd)
+        self.settings.sync()
+        self._restrict_settings_perms()
         rt = get_provider("rutracker")
         if rt and hasattr(rt, "set_credentials"):
             rt.set_credentials(user, pwd, _proxy)
+
+    def _restrict_settings_perms(self):
+        """Конфиг QSettings (~/.config/TorFlash/TorFlash.conf) хранит пароль
+        rutracker в открытом виде — закрываем доступ всем, кроме владельца (0600).
+        Не замена системному keyring, но убирает world-readable утечку."""
+        try:
+            path = self.settings.fileName()
+            if path and os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError as e:
+            print(f"[settings] chmod failed: {e}", flush=True)
 
     def _enabled_providers(self) -> list:
         return [p for p in ALL_PROVIDERS if self.provider_checks[p.name].isChecked()]
@@ -3038,8 +3198,35 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(_t("Флешка не обнаружена"), 4000)
 
+    @staticmethod
+    def _mount_device(mount: str) -> str:
+        """Узел устройства смонтированной папки через findmnt. Общий код
+        для извлечения и форматирования (раньше дублировался и разъехался)."""
+        return subprocess.run(
+            ["findmnt", "-no", "SOURCE", mount],
+            capture_output=True, text=True, check=True, timeout=5,
+        ).stdout.strip()
+
+    @staticmethod
+    def _parent_device(src: str) -> str:
+        """Родительский диск для раздела. lsblk PKNAME корректен для nvme/mmc
+        (sdb1→sdb, но nvme0n1p1→nvme0n1), в отличие от обрезки цифр регэкспом."""
+        try:
+            out = subprocess.run(
+                ["lsblk", "-no", "PKNAME", src],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip().splitlines()
+            if out and out[0].strip():
+                return f"/dev/{out[0].strip()}"
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+        return re.sub(r"p?\d+$", "", src)
+
     def eject_flash(self):
         print("[eject] start", flush=True)
+        if getattr(self, "_ejecting", False):
+            print("[eject] skip: already ejecting", flush=True)
+            return
         if self._active_dls:
             self._show_banner(_t("Идёт загрузка — дождитесь завершения перед извлечением"))
             print("[eject] skip: download in progress", flush=True)
@@ -3055,33 +3242,31 @@ class MainWindow(QMainWindow):
             return
 
         # Блокируем кнопки на время операции
+        self._ejecting = True
         self.eject_btn.setEnabled(False)
         self.flash_eject_btn.setEnabled(False)
         app = QApplication.instance()
 
         try:
-            src = subprocess.run(
-                ["findmnt", "-no", "SOURCE", mount],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
+            src = self._mount_device(mount)
             print(f"[eject] device={src}", flush=True)
             if not src:
                 self._show_banner(_t("Не удалось определить устройство для {}").format(mount))
                 return
-            parent = re.sub(r"\d+$", "", src)
+            parent = self._parent_device(src)
             print(f"[eject] parent={parent}", flush=True)
 
             # Сначала syncим
             self.statusBar().showMessage(_t("⏏ Синхронизация буферов…"))
             app.processEvents()
-            subprocess.run(["sync"], check=False)
+            subprocess.run(["sync"], check=False, timeout=15)
 
             # Размонтирование
             self.statusBar().showMessage(_t("⏏ Размонтирование…"))
             app.processEvents()
             unmount_res = subprocess.run(
                 ["udisksctl", "unmount", "-b", src],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=20,
             )
             print(
                 f"[eject] unmount rc={unmount_res.returncode} "
@@ -3123,7 +3308,7 @@ class MainWindow(QMainWindow):
             app.processEvents()
             poff = subprocess.run(
                 ["udisksctl", "power-off", "-b", parent],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=20,
             )
             print(
                 f"[eject] power-off rc={poff.returncode} "
@@ -3157,8 +3342,34 @@ class MainWindow(QMainWindow):
             print(f"[eject] subprocess error: {e}", flush=True)
             self._show_banner(_t("Ошибка: {}").format(e))
         finally:
+            self._ejecting = False
             self.eject_btn.setEnabled(True)
             self.flash_eject_btn.setEnabled(True)
+
+    def stop_all_workers(self, timeout_ms: int = 8000):
+        """Останавливает все фоновые потоки перед выходом. DownloadWorker
+        останавливаем мягко (stop — без удаления частичной закачки), CopyWorker
+        отменяем (cancel). Затем ждём завершения, чтобы интерпретатор не рвал
+        запись на флешку/в БД на полуслове."""
+        dls = [s.worker for s in list(self._active_dls.values()) if getattr(s, "worker", None)]
+        copies = [s.copy_worker for s in list(self._active_dls.values()) if getattr(s, "copy_worker", None)]
+        copies += [c for c in (self._flash_copy_active, self._pending_copy_worker) if c]
+        for w in dls:
+            try:
+                w.stop()
+            except Exception:
+                pass
+        for c in copies:
+            try:
+                c.cancel()
+            except Exception:
+                pass
+        for t in dls + copies:
+            try:
+                if t.isRunning():
+                    t.wait(timeout_ms)
+            except Exception:
+                pass
 
     # ---------- actions ----------
 
@@ -3298,9 +3509,8 @@ class MainWindow(QMainWindow):
         title = slot.result.get("title", "?")[:60] if slot else "?"
         summary = " · ".join(line for line in report)
         # Clear pending_flash_copy for this torrent
-        if slot and slot.info_hash and slot.info_hash in self.seed.library:
-            self.seed.library[slot.info_hash].pop("pending_flash_copy", None)
-            self.seed._save_library()
+        if slot and slot.info_hash:
+            self.seed.clear_pending_flash(slot.info_hash)
         self._flash_copy_active = None
         self.statusBar().showMessage(f"{_t('Готово')}: {summary}", 8000)
         self._show_banner(
@@ -3520,9 +3730,8 @@ class MainWindow(QMainWindow):
     def _on_pending_copy_done(self, report: list):
         hid = getattr(self, "_pending_copy_hash", None)
         title = getattr(self, "_pending_copy_title", "")[:80]
-        if hid and hid in self.seed.library:
-            self.seed.library[hid].pop("pending_flash_copy", None)
-            self.seed._save_library()
+        if hid:
+            self.seed.clear_pending_flash(hid)
         self._pending_copy_hash = None
         self._pending_copy_worker = None
         if hasattr(self, "lib_copy_box"):
@@ -3804,11 +4013,9 @@ class MainWindow(QMainWindow):
         hid = self._selected_lib_hash()
         if not hid:
             return
-        meta = self.seed.library.get(hid)
-        if not meta:
+        if hid not in self.seed.library:
             return
-        meta["pending_flash_copy"] = True
-        self.seed._save_library()
+        self.seed.set_pending_flash(hid, True)
         self.statusBar().showMessage(
             _t("Запланировано — скопируем при появлении флешки"), 4000
         )
@@ -3839,8 +4046,8 @@ class MainWindow(QMainWindow):
         self.update_checker.failed.connect(self._on_update_check_failed)
         self.update_checker.start()
 
-    def _on_update_found(self, version: str, url: str, asset_name: str):
-        self._pending_update = (version, url, asset_name)
+    def _on_update_found(self, version: str, url: str, asset_name: str, sha256_url: str = ""):
+        self._pending_update = (version, url, asset_name, sha256_url)
         self._show_banner(
             _t("Доступна версия v{} (сейчас v{}). Нажмите ⏏ для обновления → автозамена бинарника и перезапуск.").format(version, APP_VERSION),
             kind="info",
@@ -3869,9 +4076,9 @@ class MainWindow(QMainWindow):
                 _t("Запущена python-версия — обновление возможно только для бинарника. Запустите через ярлык TorFlash и попробуйте снова.")
             )
             return
-        version, url, _ = self._pending_update
+        version, url, _, sha256_url = self._pending_update
         binary_dir = str(Path(sys.executable).parent)
-        self._update_dl = UpdateDownloader(url, binary_dir)
+        self._update_dl = UpdateDownloader(url, binary_dir, sha256_url)
         self._updating = True
         self.progress_phase.setText(_t("Обновление до v{}").format(version))
         self.progress_bar.setValue(0)
@@ -4158,6 +4365,10 @@ def main():
 
     # Корректное закрытие seed-сессии и сохранение resume_data
     def _on_about_to_quit():
+        try:
+            w.stop_all_workers()
+        except Exception:
+            print(f"[main] stop workers error:\n{traceback.format_exc()}", flush=True)
         try:
             w.seed.shutdown()
         except Exception:
