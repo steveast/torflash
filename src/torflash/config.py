@@ -13,10 +13,10 @@ APP_VERSION = "1.9.1"
 GITHUB_REPO = "steveast/torflash"
 
 
-# Публичный ключ minisign для проверки подписи обновлений (вторая строка .pub).
-# Пусто = проверка подписи выключена, работает только SHA-256. Заполнить, когда
-# сгенерируешь ключ (`minisign -G`) и добавишь приватный в repo secret MINISIGN_KEY.
-MINISIGN_PUBKEY = ""
+# Публичный ключ minisign для проверки подписи обновлений (вторая строка .pub,
+# key id 9C9CBE581B22E937). Непусто → обновление ставится только с валидной
+# подписью .minisig (приватный ключ — в repo secret MINISIGN_KEY, подпись в CI).
+MINISIGN_PUBKEY = "RWQ36SIbWL6cnKN/xGvXX4TOAD7n1cvJ6lYMA6wEpWQpu6fxvhxwRf7r"
 
 
 def _assets_dir() -> Path:

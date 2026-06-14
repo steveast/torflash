@@ -17,12 +17,17 @@ hiddenimports = [
     'torflash.workers', 'torflash.workers.copy_worker', 'torflash.workers.search_worker',
     'torflash.workers.meta_fetcher', 'torflash.workers.poster_fetcher',
     'torflash.update', 'torflash.update.checker', 'torflash.update.downloader',
+    'torflash.update.signature',
     'torflash.widgets', 'torflash.widgets.speed_graph', 'torflash.widgets.sortable_item',
     'torflash.ui', 'torflash.ui.main_window',
     'torflash.providers', 'torflash.providers.base', 'torflash.providers.rutor',
     'torflash.providers.nnm', 'torflash.providers.rutracker',
 ]
 tmp_ret = collect_all('requests')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# cryptography — для проверки minisign-подписи обновлений (ленивый импорт в
+# torflash/update/signature.py, поэтому тянем явно).
+tmp_ret = collect_all('cryptography')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
