@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSettings, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QGuiApplication, QIcon, QKeySequence
+from PyQt5.QtGui import QClipboard, QFont, QGuiApplication, QIcon, QKeySequence
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -1451,6 +1451,13 @@ class MainWindow(QMainWindow):
         # Игнорируем если пользователь уже выбрал другой торрент
         if getattr(self, "_current_meta_url", None) != url:
             return
+        # Сохраняем добытый magnet в результат, чтобы «Копировать magnet»
+        # работал для источников без magnet в листинге (NNM/RuTracker).
+        m = (data.get("magnet") or "").strip()
+        if m:
+            cur = self.current_result()
+            if cur and cur.get("page") == url and not (cur.get("magnet") or "").strip():
+                cur["magnet"] = m
         desc = data.get("description") or ""
         if desc:
             self.description_view.setPlainText(desc.strip())
@@ -1944,12 +1951,41 @@ class MainWindow(QMainWindow):
 
     # ---------- actions ----------
 
+    def _set_clipboard(self, text: str):
+        """Кладём и в основной буфер, и в X11 PRIMARY (paste средней кнопкой) —
+        иначе на части окружений «иногда не вставляется»."""
+        cb = QGuiApplication.clipboard()
+        cb.setText(text, QClipboard.Clipboard)
+        if cb.supportsSelection():
+            cb.setText(text, QClipboard.Selection)
+
     def copy_magnet(self):
         r = self.current_result()
         if not r:
             return
-        QGuiApplication.clipboard().setText(r["magnet"])
-        self.statusBar().showMessage(_t("Magnet скопирован"), 3000)
+        magnet = (r.get("magnet") or "").strip()
+        if magnet:
+            self._set_clipboard(magnet)
+            self.statusBar().showMessage(_t("Magnet скопирован"), 3000)
+            return
+        # У NNM/RuTracker magnet нет в листинге — достаём со страницы раздачи.
+        page = r.get("page") or ""
+        if not page:
+            self._show_banner(_t("У этого источника нет magnet — используйте «Скачать»"))
+            return
+        self.statusBar().showMessage(_t("Получаю magnet…"), 5000)
+        fetcher = MetaFetcher(page)
+
+        def _on_magnet(url, data, _r=r):
+            m = (data.get("magnet") or "").strip()
+            if m:
+                _r["magnet"] = m
+                self._set_clipboard(m)
+                self.statusBar().showMessage(_t("Magnet скопирован"), 3000)
+            else:
+                self._show_banner(_t("У этого источника нет magnet — используйте «Скачать»"))
+        fetcher.fetched.connect(_on_magnet)
+        self._track_thread(fetcher)
 
     def open_page(self):
         r = self.current_result()
