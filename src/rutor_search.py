@@ -4,6 +4,16 @@
 import sys
 import traceback
 
+# Импортируем libtorrent ДО PyQt5. На Windows PyQt5 бандлит OpenSSL 1.1, а
+# колесо libtorrent линкуется с другим OpenSSL; если Qt загрузит свои DLL
+# первым, создание lt.session() падает с access violation (0xC0000005).
+# Импорт здесь грузит OpenSSL из libtorrent первым и снимает конфликт.
+# На Linux это безвредный no-op.
+try:
+    import libtorrent  # noqa: F401
+except ImportError:
+    pass
+
 from PyQt5.QtCore import QSharedMemory
 from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import QApplication
