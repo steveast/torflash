@@ -2,6 +2,35 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.10.0] — 2026-06-18
+Cross-platform support — Windows and macOS.
+- New OS abstraction layer (`torflash/platform/`): flash-drive detection,
+  FAT32 format, safe eject, "open in file manager", autostart and self-update
+  install are now routed through a `PlatformBackend` with `linux`/`windows`/
+  `macos` implementations. Linux behaviour is unchanged (still udisks2/udisksctl
+  + XDG autostart).
+- Windows backend: removable-drive enumeration and eject via Win32 (`ctypes`,
+  no extra deps), FAT32 format via PowerShell `Format-Volume`, autostart via the
+  `HKCU\…\Run` registry key, and a deferred `.bat` helper for self-update
+  (a running `.exe` can't replace itself in place).
+- macOS backend (experimental): `diskutil` for detection/format/eject, a
+  LaunchAgent for autostart. Unsigned builds are blocked by Gatekeeper — see
+  `docs/cross-platform.md` for signing/notarization.
+- Per-OS data dir: `%LOCALAPPDATA%\TorFlash` (Windows),
+  `~/Library/Application Support/TorFlash` (macOS), `$XDG_DATA_HOME` (Linux).
+- Auto-updater selects the right release asset per platform; notifications fall
+  back to the system tray where `notify-send` is absent.
+- CI builds Windows (`.exe`) and macOS (`.app.zip`) alongside Linux; PyInstaller
+  spec gained per-OS icon and a macOS `.app` bundle.
+- Windows run-from-source/build fixes: import `libtorrent` before PyQt5 to avoid
+  an OpenSSL DLL clash (`0xC0000005`), strip the bundled MSVC runtime from the
+  PyInstaller build so it uses the system one, read HTML test fixtures as UTF-8,
+  and a `run.ps1` launcher.
+- Listen-port fallback: if 6881 is taken (e.g. another torrent client), bind the
+  first free port in 6881–6900, else let the OS pick an ephemeral one, with a
+  status-bar warning instead of a silent "listening on 0". Noisy
+  `udp_error_alert` log spam from NATed uTP peers is suppressed.
+
 ## [1.9.2] — 2026-06-14
 Security: signed releases.
 - Releases are now signed with minisign (Ed25519). The auto-updater verifies

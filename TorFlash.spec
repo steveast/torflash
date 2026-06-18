@@ -1,5 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import sys
+
 from PyInstaller.utils.hooks import collect_all
+
+sys.path.insert(0, os.path.join(SPECPATH, 'src'))
+from torflash.config import APP_VERSION
 
 datas = [
     ('assets/torflash.svg', '.'),
@@ -22,6 +28,10 @@ hiddenimports = [
     'torflash.ui', 'torflash.ui.main_window',
     'torflash.providers', 'torflash.providers.base', 'torflash.providers.rutor',
     'torflash.providers.nnm', 'torflash.providers.rutracker',
+    # Платформенные бэкенды импортируются лениво в torflash/platform/__init__.py
+    # (по sys.platform) — статический анализ PyInstaller их не находит.
+    'torflash.platform', 'torflash.platform.base', 'torflash.platform.linux',
+    'torflash.platform.windows', 'torflash.platform.macos',
 ]
 tmp_ret = collect_all('requests')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -44,7 +54,37 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Windows: колесо PyQt5 несёт более старый MSVC C++ runtime, чем тот, под
+# который собран libtorrent 2.0.x. Если обе копии оказываются в одном _MEIPASS,
+# PyInstaller оставляет старую, и создание lt.session() падает с access
+# violation (0xC0000005). Выкидываем бандлёный runtime — exe возьмёт системный
+# (его ставит распространяемый пакет VC++ 2015-2022, нужный и самому Python).
+if sys.platform == 'win32':
+    _msvc_rt = {
+        'vcruntime140.dll', 'vcruntime140_1.dll',
+        'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+        'concrt140.dll',
+    }
+    a.binaries = [b for b in a.binaries
+                  if os.path.basename(b[0]).lower() not in _msvc_rt]
+
 pyz = PYZ(a.pure)
+
+
+# Иконка приложения, специфичная для платформы (если файл присутствует).
+# Windows: .ico, macOS: .icns. На Linux иконку даёт .desktop/тема.
+def _app_icon():
+    if sys.platform == 'win32':
+        ico = os.path.join('assets', 'torflash.ico')
+        return ico if os.path.exists(ico) else None
+    if sys.platform == 'darwin':
+        icns = os.path.join('assets', 'torflash.icns')
+        return icns if os.path.exists(icns) else None
+    return None
+
+
+app_icon = _app_icon()
 
 exe = EXE(
     pyz,
@@ -65,4 +105,22 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon,
 )
+
+# macOS: оборачиваем исполняемый файл в .app-бандл (нужно для нормального
+# запуска GUI и последующей подписи/нотаризации).
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        exe,
+        name='TorFlash.app',
+        icon=app_icon,
+        bundle_identifier='pro.torflash',
+        info_plist={
+            'CFBundleName': 'TorFlash',
+            'CFBundleDisplayName': 'TorFlash',
+            'CFBundleShortVersionString': APP_VERSION,
+            'NSHighResolutionCapable': True,
+            'LSMinimumSystemVersion': '11.0',
+        },
+    )

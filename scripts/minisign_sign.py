@@ -13,6 +13,7 @@
 """
 import base64
 import hashlib
+import os
 import sys
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -35,7 +36,7 @@ def sign_file(key_id: bytes, sk: Ed25519PrivateKey, path: str):
     data = open(path, "rb").read()
     prehash = hashlib.blake2b(data, digest_size=64).digest()
     sig = sk.sign(prehash)                       # подпись над BLAKE2b(файл) (алгоритм "ED")
-    name = path.rsplit("/", 1)[-1]
+    name = os.path.basename(path)                # кроссплатформенно (Windows: \\)
     trusted = f"timestamp:0\tfile:{name}\thashed"
     global_sig = sk.sign(sig + trusted.encode())  # глобальная подпись над sig+trusted comment
     out = (

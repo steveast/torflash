@@ -1,7 +1,6 @@
 """TorFlash: главное окно приложения (вкладки поиск/библиотека/флешка/настройки)."""
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -49,12 +48,13 @@ from PyQt5.QtWidgets import (
 from torflash.providers import ALL_PROVIDERS, get_provider
 from torflash.providers.rutor import CATEGORIES as RUTOR_CATEGORIES
 from torflash.config import (
-    APP_NAME, APP_VERSION, ASSETS_DIR, STORAGE_DEFAULT, AUTOSTART_FILE, SEARCH_HISTORY_MAX, FAT32_MAX_PART, VIDEO_EXTS, _proxies, set_proxy, current_proxy,
+    APP_NAME, APP_VERSION, ASSETS_DIR, STORAGE_DEFAULT, SEARCH_HISTORY_MAX, FAT32_MAX_PART, VIDEO_EXTS, _proxies, set_proxy, current_proxy,
 )
 from torflash.i18n import _t, set_language
 from torflash.helpers import (
-    human_bytes, parse_size_text, fmt_time, _result_id, detect_flash_mount, group_movie_parts, MAGNET_HASH_RE,
+    human_bytes, parse_size_text, fmt_time, _result_id, group_movie_parts, MAGNET_HASH_RE,
 )
+from torflash.platform import backend
 from torflash.session.seed_session import SeedSession
 from torflash.session.download_worker import DownloadWorker
 from torflash.workers.copy_worker import CopyWorker
@@ -92,7 +92,7 @@ class MainWindow(QMainWindow):
         # Temporary UI state for the currently displayed progress
         self.dl_phase: str = ""
         self.dl_progress: tuple = (0, "")
-        flash = detect_flash_mount()
+        flash = backend.find_flash_mount()
         if flash:
             self.dst_dir: str = str(Path(flash) / "Movies")
             self._initial_use_flash = True
@@ -139,6 +139,8 @@ class MainWindow(QMainWindow):
         # Применяем сохранённые настройки скорости и темы
         self._apply_settings()
         self._refresh_library()
+        if self.seed.listen_warning:
+            self.statusBar().showMessage(self.seed.listen_warning, 10000)
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
         QShortcut(QKeySequence("Escape"), self, self._on_escape)
@@ -146,7 +148,7 @@ class MainWindow(QMainWindow):
         self.table.installEventFilter(self)
         self.lib_table.installEventFilter(self)
         # Track previous flash state for notifications
-        self._prev_flash_mount: str | None = detect_flash_mount()
+        self._prev_flash_mount: str | None = backend.find_flash_mount()
 
     # ---------- UI building ----------
 
@@ -442,7 +444,7 @@ class MainWindow(QMainWindow):
         )
         v.addWidget(self.cb_minimize)
         self.cb_autostart = QCheckBox(_t("Запускать при входе в систему"))
-        self.cb_autostart.setChecked(AUTOSTART_FILE.exists())
+        self.cb_autostart.setChecked(backend.is_autostart_enabled())
         self.cb_autostart.toggled.connect(self._apply_autostart)
         v.addWidget(self.cb_autostart)
         self.cb_hidden = QCheckBox(_t("Скрытый старт (только иконка в трее)"))
@@ -579,31 +581,14 @@ class MainWindow(QMainWindow):
         self.seed.apply_rate_limits(down, up)
 
     def _apply_autostart(self, enabled: bool):
-        if enabled:
-            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
-            exe = sys.executable if getattr(sys, "frozen", False) else f"/usr/bin/python3 {Path(__file__).resolve()}"
-            icon = ASSETS_DIR / "torflash.svg"
-            content = (
-                "[Desktop Entry]\n"
-                "Type=Application\n"
-                f"Name={APP_NAME}\n"
-                f"Exec={exe} --hidden\n"
-                f"Icon={icon}\n"
-                "Terminal=false\n"
-                "X-GNOME-Autostart-enabled=true\n"
-                f"X-KDE-autostart-after=panel\n"
-            )
-            AUTOSTART_FILE.write_text(content)
-            AUTOSTART_FILE.chmod(0o755)
-        else:
-            AUTOSTART_FILE.unlink(missing_ok=True)
+        backend.set_autostart(enabled)
 
     def _on_tab_changed(self, index: int):
         if index == 2:
             self._refresh_flash_tab()
 
     def _refresh_flash_tab(self):
-        mount = detect_flash_mount()
+        mount = backend.find_flash_mount()
         if not mount:
             self.flash_summary.setText(_t("Флешка не подключена"))
             self.flash_summary.setProperty("state", "off")
@@ -613,16 +598,10 @@ class MainWindow(QMainWindow):
             return
         try:
             usage = shutil.disk_usage(mount)
-            fs = ""
-            try:
-                fs = subprocess.run(
-                    ["findmnt", "-no", "FSTYPE", mount],
-                    capture_output=True, text=True, check=True, timeout=2,
-                ).stdout.strip()
-            except (subprocess.SubprocessError, OSError):
-                pass
+            fs = backend.flash_fstype(mount)
+            label = backend.volume_label(mount) or Path(mount).name or mount
             self.flash_summary.setText(
-                f"<b>{Path(mount).name}</b> ({mount})"
+                f"<b>{label}</b> ({mount})"
                 + (f" · {fs}" if fs else "")
                 + f" · {_t('свободно')} <b>{human_bytes(usage.free)}</b> / {human_bytes(usage.total)}"
             )
@@ -673,12 +652,9 @@ class MainWindow(QMainWindow):
         self._update_flash_buttons_state()
 
     def _open_flash_folder(self):
-        mount = detect_flash_mount()
-        if mount:
-            try:
-                subprocess.Popen(["xdg-open", mount])
-            except OSError as e:
-                self.statusBar().showMessage(_t("Ошибка: {}").format(e), 3000)
+        mount = backend.find_flash_mount()
+        if mount and not backend.open_path(mount):
+            self.statusBar().showMessage(_t("Не удалось открыть {}").format(mount), 3000)
 
     def _flash_file_menu(self, pos):
         item = self.flash_files_table.itemAt(pos)
@@ -695,7 +671,7 @@ class MainWindow(QMainWindow):
         # Открыть — для первой части (для одиночных это и есть сам файл)
         act_open = menu.addAction(_t("Открыть"))
         first = paths[0]
-        act_open.triggered.connect(lambda: subprocess.Popen(["xdg-open", first]))
+        act_open.triggered.connect(lambda: backend.open_path(first))
         menu.addSeparator()
         label = _t("Удалить с флешки") if len(paths) == 1 else _t("Удалить с флешки ({} частей)").format(len(paths))
         act_del = menu.addAction(label)
@@ -785,7 +761,7 @@ class MainWindow(QMainWindow):
         if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner(_t("Идёт копирование — дождитесь завершения"))
             return
-        mount = detect_flash_mount()
+        mount = backend.find_flash_mount()
         if not mount:
             self._show_banner(_t("Флешка не смонтирована"))
             return
@@ -828,78 +804,44 @@ class MainWindow(QMainWindow):
         if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner(_t("Идёт копирование — дождитесь завершения перед форматированием"))
             return
-        mount = detect_flash_mount()
+        mount = backend.find_flash_mount()
         if not mount:
             self._show_banner(_t("Флешка не смонтирована"))
             return
-        try:
-            src = self._mount_device(mount)
-        except (subprocess.SubprocessError, FileNotFoundError) as e:
-            self._show_banner(f"findmnt: {e}")
-            return
-        if not src:
+        device = backend.flash_device(mount)
+        if not device:
             self._show_banner(_t("Не удалось определить устройство для {}").format(mount))
             return
-        # Запомним текущую метку, чтобы сохранить
-        label = Path(mount).name or "KINGSTON"
-        try:
-            cur_label = subprocess.run(
-                ["lsblk", "-no", "LABEL", src],
-                capture_output=True, text=True, timeout=3,
-            ).stdout.strip()
-            if cur_label:
-                label = cur_label
-        except (subprocess.SubprocessError, FileNotFoundError):
-            pass
+        # Сохраняем текущую метку при форматировании.
+        label = backend.volume_label(mount) or "KINGSTON"
         usage = shutil.disk_usage(mount)
         if not self._arm_flash_btn(
             self.flash_format_btn,
-            _t("Подтвердите: форматировать {}").format(src),
-            _t("Будут стёрты ВСЕ данные на {} ({}, {}). После форматирования: FAT32, метка «{}». Нажмите ещё раз для подтверждения.").format(src, Path(mount).name, human_bytes(usage.total), label),
+            _t("Подтвердите: форматировать {}").format(device),
+            _t("Будут стёрты ВСЕ данные на {} ({}, {}). После форматирования: FAT32, метка «{}». Нажмите ещё раз для подтверждения.").format(device, label, human_bytes(usage.total), label),
         ):
             return
-        try:
-            subprocess.run(["sync"], check=False, timeout=10)
-            unmount = subprocess.run(
-                ["udisksctl", "unmount", "-b", src],
-                capture_output=True, text=True, timeout=15,
-            )
-            if unmount.returncode != 0:
-                self._show_banner(
-                    _t("Не удалось размонтировать: ") + (unmount.stderr or unmount.stdout).strip()
-                )
-                return
-            fmt = subprocess.run(
-                ["udisksctl", "format", "-b", src,
-                 "--type", "vfat", "--label", label, "--no-user-interaction"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if fmt.returncode != 0:
-                self._show_banner(
-                    _t("Ошибка форматирования: ") + (fmt.stderr or fmt.stdout).strip()
-                )
-                return
-            # Перемонтируем
-            mnt = subprocess.run(
-                ["udisksctl", "mount", "-b", src],
-                capture_output=True, text=True, timeout=15,
-            )
-            if mnt.returncode != 0:
-                self._show_banner(
-                    _t("Отформатировано, но не удалось примонтировать: ") + (mnt.stderr or mnt.stdout).strip(),
-                    kind="info",
-                )
+        res = backend.format_fat32(mount, label)
+        if not res.ok:
+            if res.missing_tool:
+                self._show_banner(_t("Утилита не найдена: {}").format(res.message))
+            elif res.step == "unmount":
+                self._show_banner(_t("Не удалось размонтировать: ") + res.message)
             else:
-                self._show_banner(
-                    _t("Флешка отформатирована (FAT32, метка «{}»)").format(label),
-                    kind="info",
-                )
-            self._refresh_flash_tab()
-            self._refresh_flash_info()
-        except FileNotFoundError as e:
-            self._show_banner(_t("Утилита не найдена: {}").format(e))
-        except subprocess.SubprocessError as e:
-            self._show_banner(_t("Ошибка: {}").format(e))
+                self._show_banner(_t("Ошибка форматирования: ") + res.message)
+            return
+        if res.step == "remount":
+            self._show_banner(
+                _t("Отформатировано, но не удалось примонтировать: ") + res.message,
+                kind="info",
+            )
+        else:
+            self._show_banner(
+                _t("Флешка отформатирована (FAT32, метка «{}»)").format(label),
+                kind="info",
+            )
+        self._refresh_flash_tab()
+        self._refresh_flash_info()
 
     def _build_library_detail(self) -> QWidget:
         outer = QScrollArea()
@@ -1742,7 +1684,7 @@ class MainWindow(QMainWindow):
 
     def _on_flash_toggle(self, checked: bool):
         if checked:
-            flash = detect_flash_mount()
+            flash = backend.find_flash_mount()
             if not flash:
                 self.statusBar().showMessage(_t("Флешка не обнаружена — выключаю"), 4000)
                 self.flash_check.blockSignals(True)
@@ -1767,7 +1709,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(_t("Папка: {}").format(d), 3000)
 
     def redetect_flash(self):
-        flash = detect_flash_mount()
+        flash = backend.find_flash_mount()
         if flash:
             if self.flash_check.isChecked():
                 self.dst_dir = str(Path(flash) / "Movies")
@@ -1776,45 +1718,16 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(_t("Флешка не обнаружена"), 4000)
 
-    @staticmethod
-    def _mount_device(mount: str) -> str:
-        """Узел устройства смонтированной папки через findmnt. Общий код
-        для извлечения и форматирования (раньше дублировался и разъехался)."""
-        return subprocess.run(
-            ["findmnt", "-no", "SOURCE", mount],
-            capture_output=True, text=True, check=True, timeout=5,
-        ).stdout.strip()
-
-    @staticmethod
-    def _parent_device(src: str) -> str:
-        """Родительский диск для раздела. lsblk PKNAME корректен для nvme/mmc
-        (sdb1→sdb, но nvme0n1p1→nvme0n1), в отличие от обрезки цифр регэкспом."""
-        try:
-            out = subprocess.run(
-                ["lsblk", "-no", "PKNAME", src],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip().splitlines()
-            if out and out[0].strip():
-                return f"/dev/{out[0].strip()}"
-        except (subprocess.SubprocessError, FileNotFoundError, OSError):
-            pass
-        return re.sub(r"p?\d+$", "", src)
-
     def eject_flash(self):
-        print("[eject] start", flush=True)
         if getattr(self, "_ejecting", False):
-            print("[eject] skip: already ejecting", flush=True)
             return
         if self._active_dls:
             self._show_banner(_t("Идёт загрузка — дождитесь завершения перед извлечением"))
-            print("[eject] skip: download in progress", flush=True)
             return
         if self._flash_copy_active and self._flash_copy_active.isRunning():
             self._show_banner(_t("Идёт копирование на флешку — дождитесь завершения"))
-            print("[eject] skip: copy in progress", flush=True)
             return
-        mount = detect_flash_mount()
-        print(f"[eject] mount={mount}", flush=True)
+        mount = backend.find_flash_mount()
         if not mount:
             self._show_banner(_t("Флешка не смонтирована"))
             return
@@ -1825,86 +1738,40 @@ class MainWindow(QMainWindow):
         self.flash_eject_btn.setEnabled(False)
         app = QApplication.instance()
 
+        status_text = {
+            "sync": _t("⏏ Синхронизация буферов…"),
+            "unmount": _t("⏏ Размонтирование…"),
+            "poweroff": _t("⏏ Отключение питания устройства…"),
+        }
+
+        def on_status(step: str):
+            self.statusBar().showMessage(status_text.get(step, step))
+            if app:
+                app.processEvents()
+
         try:
-            src = self._mount_device(mount)
-            print(f"[eject] device={src}", flush=True)
-            if not src:
-                self._show_banner(_t("Не удалось определить устройство для {}").format(mount))
+            res = backend.eject(mount, on_status=on_status)
+            if not res.ok:
+                if res.step == "detect":
+                    self._show_banner(_t("Не удалось определить устройство для {}").format(mount))
+                elif res.missing_tool:
+                    self._show_banner(_t("Утилита не найдена: {}").format(res.message))
+                elif res.step == "unmount":
+                    msg = _t("Не удалось размонтировать: {}").format(res.message)
+                    if res.busy:
+                        msg += "\n" + _t("Держат: {}").format(res.busy)
+                    self._show_banner(msg)
+                else:
+                    self._show_banner(_t("Ошибка: {}").format(res.message))
                 return
-            parent = self._parent_device(src)
-            print(f"[eject] parent={parent}", flush=True)
-
-            # Сначала syncим
-            self.statusBar().showMessage(_t("⏏ Синхронизация буферов…"))
-            app.processEvents()
-            subprocess.run(["sync"], check=False, timeout=15)
-
-            # Размонтирование
-            self.statusBar().showMessage(_t("⏏ Размонтирование…"))
-            app.processEvents()
-            unmount_res = subprocess.run(
-                ["udisksctl", "unmount", "-b", src],
-                capture_output=True, text=True, timeout=20,
-            )
-            print(
-                f"[eject] unmount rc={unmount_res.returncode} "
-                f"stdout={unmount_res.stdout.strip()!r} "
-                f"stderr={unmount_res.stderr.strip()!r}",
-                flush=True,
-            )
-            if unmount_res.returncode != 0:
-                # Узнаём, кто держит
-                busy = ""
-                try:
-                    lsof = subprocess.run(
-                        ["lsof", "+D", mount],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    print(f"[eject] lsof rc={lsof.returncode}", flush=True)
-                    lines = [l for l in lsof.stdout.splitlines() if l and not l.startswith("COMMAND")]
-                    print(f"[eject] lsof lines: {len(lines)}", flush=True)
-                    if lines:
-                        # Берём имя процесса и PID — colонки 1 и 2
-                        procs = set()
-                        for l in lines[:20]:
-                            parts = l.split()
-                            if len(parts) >= 2:
-                                procs.add(f"{parts[0]}({parts[1]})")
-                        busy = ", ".join(sorted(procs))
-                        print(f"[eject] busy: {busy}", flush=True)
-                except (FileNotFoundError, subprocess.SubprocessError) as e:
-                    print(f"[eject] lsof not available: {e}", flush=True)
-                err_msg = (unmount_res.stderr or unmount_res.stdout or "").strip()
-                msg = _t("Не удалось размонтировать: {}").format(err_msg)
-                if busy:
-                    msg += "\n" + _t("Держат: {}").format(busy)
-                self._show_banner(msg)
-                return
-
-            # Power-off
-            self.statusBar().showMessage(_t("⏏ Отключение питания устройства…"))
-            app.processEvents()
-            poff = subprocess.run(
-                ["udisksctl", "power-off", "-b", parent],
-                capture_output=True, text=True, timeout=20,
-            )
-            print(
-                f"[eject] power-off rc={poff.returncode} "
-                f"stdout={poff.stdout.strip()!r} "
-                f"stderr={poff.stderr.strip()!r}",
-                flush=True,
-            )
-            if poff.returncode != 0:
-                # unmount удался, но power-off нет — флешка размонтирована, можно вынимать
+            if res.step == "poweroff":
                 self._show_banner(
-                    _t("Размонтировано, но power-off не сработал: {}. Можно вынимать.").format(
-                        (poff.stderr or poff.stdout).strip()
-                    ),
+                    _t("Размонтировано, но power-off не сработал: {}. Можно вынимать.").format(res.message),
                     kind="info",
                 )
             else:
                 self._show_banner(
-                    _t("Флешка извлечена ({}) — можно вынимать").format(src), kind="info"
+                    _t("Флешка извлечена ({}) — можно вынимать").format(res.device or mount), kind="info"
                 )
             # Переходим в режим ~/Storage
             self.flash_check.blockSignals(True)
@@ -1913,12 +1780,6 @@ class MainWindow(QMainWindow):
             self.dst_dir = str(Path.home() / "Storage")
             self.dst_edit.setText(self.dst_dir)
             self.statusBar().showMessage(_t("Флешка безопасно извлечена"), 5000)
-        except FileNotFoundError as e:
-            print(f"[eject] tool missing: {e}", flush=True)
-            self._show_banner(_t("Утилита не найдена: {}").format(e))
-        except subprocess.SubprocessError as e:
-            print(f"[eject] subprocess error: {e}", flush=True)
-            self._show_banner(_t("Ошибка: {}").format(e))
         finally:
             self._ejecting = False
             self.eject_btn.setEnabled(True)
@@ -2186,7 +2047,7 @@ class MainWindow(QMainWindow):
     def _refresh_flash_info(self):
         if not hasattr(self, "flash_info"):
             return
-        mount = detect_flash_mount()
+        mount = backend.find_flash_mount()
         # Notify on flash connect/disconnect
         prev = getattr(self, "_prev_flash_mount", None)
         if mount and not prev:
@@ -2210,16 +2071,8 @@ class MainWindow(QMainWindow):
             self.flash_info.setText(_t("Ошибка чтения {}: {}").format(mount, e))
             set_state("warn")
             return
-        fs = ""
-        try:
-            res = subprocess.run(
-                ["findmnt", "-no", "FSTYPE", mount],
-                capture_output=True, text=True, check=True, timeout=2,
-            )
-            fs = res.stdout.strip()
-        except (subprocess.SubprocessError, OSError, FileNotFoundError):
-            pass
-        label = Path(mount).name
+        fs = backend.flash_fstype(mount)
+        label = backend.volume_label(mount) or Path(mount).name or mount
         text = (
             f"<b>{label}</b> ({mount})"
             + (f" · {fs}" if fs else "")
@@ -2288,7 +2141,7 @@ class MainWindow(QMainWindow):
             return
         if self._flash_copy_active and self._flash_copy_active.isRunning():
             return
-        mount = detect_flash_mount()
+        mount = backend.find_flash_mount()
         if not mount:
             return
         for r in rows:
@@ -2412,10 +2265,8 @@ class MainWindow(QMainWindow):
         if not meta:
             return
         save = Path(meta.get("save_path", STORAGE_DEFAULT))
-        try:
-            subprocess.Popen(["xdg-open", str(save)])
-        except OSError as e:
-            self._show_banner(_t("Не открыть {}: {}").format(save, e))
+        if not backend.open_path(str(save)):
+            self._show_banner(_t("Не удалось открыть {}").format(save))
 
     def _lib_remove(self, info_hash: str, delete_files: bool):
         self.seed.remove(info_hash, delete_files=delete_files)
@@ -2707,20 +2558,26 @@ class MainWindow(QMainWindow):
     def _on_update_dl_done(self, new_path: str):
         self._updating = False
         self.progress_box.setVisible(False)
-        current = Path(sys.executable)
-        try:
-            os.replace(new_path, current)
-        except OSError as e:
-            self._show_banner(_t("Не удалось заменить бинарник: {}").format(e))
-            return
+        current = str(Path(sys.executable))
         self._show_banner(
             _t("Обновление установлено. Перезапуск…"),
             kind="info",
         )
-        # exec на самого себя — на Linux замена ELF inode допустима для запущенного процесса
+        app = QApplication.instance()
+        if app:
+            app.processEvents()
         if self.tray:
             self.tray.hide()
-        os.execv(str(current), [str(current)] + sys.argv[1:])
+        try:
+            # Linux/macOS: заменяет бинарник и делает execv (сюда не вернётся).
+            # Windows: запускает отложенный хелпер замены и возвращается.
+            backend.install_update(new_path, current, sys.argv[1:])
+        except OSError as e:
+            self._show_banner(_t("Не удалось заменить бинарник: {}").format(e))
+            return
+        # Достижимо только на Windows: завершаем процесс, чтобы хелпер заменил .exe.
+        if app:
+            app.quit()
 
     def _on_update_dl_failed(self, err: str):
         self._updating = False
@@ -2738,13 +2595,19 @@ class MainWindow(QMainWindow):
     # ---------- notifications ----------
 
     def _notify(self, title: str, body: str):
-        """Send desktop notification via notify-send."""
-        try:
-            icon_path = str(ASSETS_DIR / "torflash.svg")
-            cmd = ["notify-send", "-a", APP_NAME, "-i", icon_path, title, body]
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (FileNotFoundError, OSError):
-            pass  # notify-send not available
+        """Системное уведомление. Linux — notify-send (как раньше); на Windows/
+        macOS (и Linux без notify-send) — через системный трей."""
+        if sys.platform.startswith("linux"):
+            try:
+                icon_path = str(ASSETS_DIR / "torflash.svg")
+                cmd = ["notify-send", "-a", APP_NAME, "-i", icon_path, title, body]
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except (FileNotFoundError, OSError):
+                pass  # notify-send недоступен — упадём в трей ниже
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.supportsMessages():
+            tray.showMessage(title, body, self.windowIcon())
 
     # ---------- keyboard shortcuts ----------
 

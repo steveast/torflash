@@ -1,5 +1,6 @@
 """TorFlash: константы, пути и глобальное состояние прокси (без Qt)."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from pathlib import Path
 APP_NAME = "TorFlash"
 
 
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.10.0"
 
 
 GITHUB_REPO = "steveast/torflash"
@@ -31,7 +32,22 @@ def _assets_dir() -> Path:
 ASSETS_DIR = _assets_dir()
 
 
-LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
+def _data_dir() -> Path:
+    """Каталог пользовательских данных приложения, специфичный для ОС.
+
+    Linux:   ~/.local/share/TorFlash (как исторически — НЕ через XDG_DATA_HOME,
+             чтобы у существующих пользователей библиотека не «переехала»).
+    Windows: %LOCALAPPDATA%\\TorFlash.
+    macOS:   ~/Library/Application Support/TorFlash."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / APP_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    return Path.home() / ".local" / "share" / APP_NAME
+
+
+LIBRARY_DIR = _data_dir()
 
 
 TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"
@@ -46,9 +62,6 @@ LIBRARY_FILE = LIBRARY_DIR / "library.json"
 STORAGE_DEFAULT = Path.home() / "Storage"
 
 
-AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "TorFlash.desktop"
-
-
 EXTRA_TRACKERS = [
     "https://tracker.opentrackr.org:443/announce",
     "https://tracker.gbitt.info:443/announce",
@@ -59,6 +72,15 @@ EXTRA_TRACKERS = [
 
 
 SEARCH_HISTORY_MAX = 30
+
+
+# libtorrent слушает TCP+UDP на этом порту. Если занят (например, параллельно
+# запущен другой торрент-клиент), пробуем следующие до DEFAULT_LISTEN_PORT+SPAN,
+# затем отдаём выбор порта ОС (0). Жёсткий один порт = «listening on 0» и тишина.
+DEFAULT_LISTEN_PORT = 6881
+
+
+LISTEN_PORT_SPAN = 20
 
 
 _proxy: str = ""

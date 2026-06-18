@@ -13,7 +13,9 @@ English · **[Русский](README.ru.md)**
   <img src="assets/screenshot.png" alt="TorFlash screenshot" width="800">
 </p>
 
-A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open KTorrent, wait, copy manually" dance.
+A cross-platform desktop app in PyQt5 (Linux, Windows, macOS). Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open a torrent client, wait, copy manually" dance.
+
+> Linux is the primary, fully-tested target. Windows is supported (CI builds a signed `.exe`); macOS is experimental and needs signing/notarization to pass Gatekeeper. See [docs/cross-platform.md](docs/cross-platform.md).
 
 ## Features
 
@@ -61,6 +63,10 @@ UI: list on the left, detail card on the right, progress embedded in the card.
 
 ### Pre-built binary (recommended)
 
+Grab the asset for your OS from the [latest release](https://github.com/steveast/torflash/releases/latest).
+
+**Linux** — a single self-contained binary:
+
 ```bash
 mkdir -p ~/Apps/TorFlash && cd ~/Apps/TorFlash
 curl -L -o TorFlash https://github.com/steveast/torflash/releases/latest/download/TorFlash
@@ -68,11 +74,21 @@ chmod +x TorFlash
 ./TorFlash
 ```
 
-The binary is built with PyInstaller; it bundles Python, PyQt5, libtorrent and requests. Only system libraries are required: Qt5, glibc, OpenSSL.
+It bundles Python, PyQt5, libtorrent and requests; only system libraries are required: Qt5, glibc, OpenSSL.
+
+**Windows** — download `TorFlash.exe` from the release and run it. The signed `.exe` needs the [VC++ 2015–2022 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) (most systems already have it). USB auto-detect, FAT32 format and safe eject use Win32 directly — no extra tools.
+
+**macOS** (experimental) — download `TorFlash-macos.app.zip`, unzip and move `TorFlash.app` to `/Applications`. Builds are currently unsigned, so Gatekeeper blocks them: right-click → **Open** the first time, or `xattr -dr com.apple.quarantine TorFlash.app`. See [docs/cross-platform.md](docs/cross-platform.md).
+
+### Verify the download
+
+Every asset ships a `.sha256` and a minisign `.minisig`; the in-app updater verifies them automatically, and you can check by hand — see the [release notes](https://github.com/steveast/torflash/releases/latest).
 
 ### From source
 
-You'll need Python 3.11+ and these system packages (Arch):
+You'll need Python 3.11+ and `libtorrent` with Python bindings.
+
+**Linux** (Arch):
 
 ```bash
 sudo pacman -S libtorrent-rasterbar python-pyqt5 python-requests mkvtoolnix-cli
@@ -82,6 +98,12 @@ python3 src/rutor_search.py
 ```
 
 For other distros, `libtorrent-rasterbar` with Python bindings ships as `python3-libtorrent` on Debian/Ubuntu or `python-libtorrent` on rpm-based systems.
+
+**Windows** — install the deps into a virtualenv (`pip install PyQt5 libtorrent requests`) and launch with the bundled PowerShell helper:
+
+```powershell
+.\run.ps1
+```
 
 ## Building the binary yourself
 

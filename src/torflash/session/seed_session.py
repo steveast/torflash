@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import socket
 import threading
 import time
 from pathlib import Path
@@ -12,9 +13,37 @@ import requests
 from torflash.config import (
     HEADERS, EXTRA_TRACKERS, LIBRARY_DIR, TORRENTS_CACHE_DIR, RESUME_DIR,
     LIBRARY_FILE, STORAGE_DEFAULT, STATS_FILE, _proxies,
+    DEFAULT_LISTEN_PORT, LISTEN_PORT_SPAN,
 )
 from torflash.i18n import _t, DL_STATES
 from torflash.helpers import _safe_join
+
+
+def _port_available(port: int) -> bool:
+    """True, если на 0.0.0.0:port свободны и TCP, и UDP. На Windows занятый
+    другим клиентом порт даёт WSAEACCES/WSAEADDRINUSE — ловим как OSError.
+    SO_EXCLUSIVEADDRUSE гарантирует, что не сочтём свободным порт, который
+    кто-то уже держит эксклюзивно (как делает uTorrent)."""
+    for sock_type in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        s = socket.socket(socket.AF_INET, sock_type)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            s.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+        finally:
+            s.close()
+    return True
+
+
+def _pick_listen_port() -> int:
+    """Первый свободный порт начиная с DEFAULT_LISTEN_PORT; если все заняты —
+    0, чтобы ОС выбрала эфемерный (закачка/DHT работают и так)."""
+    for port in range(DEFAULT_LISTEN_PORT, DEFAULT_LISTEN_PORT + LISTEN_PORT_SPAN):
+        if _port_available(port):
+            return port
+    return 0
 
 
 class SeedSession:
@@ -33,8 +62,22 @@ class SeedSession:
         self.stats = self._load_stats()
         self._prev_session_dl = 0
         self._prev_session_ul = 0
+        # Предупреждение для UI, если не удалось занять желаемый порт.
+        self.listen_warning: str = ""
+        port = _pick_listen_port()
+        if port == 0:
+            self.listen_warning = _t(
+                "Порты {}–{} заняты (другой торрент-клиент?). "
+                "Слушаю случайный порт — входящие соединения могут не работать."
+            ).format(DEFAULT_LISTEN_PORT, DEFAULT_LISTEN_PORT + LISTEN_PORT_SPAN - 1)
+            print(f"[seed] WARN: {self.listen_warning}", flush=True)
+        elif port != DEFAULT_LISTEN_PORT:
+            self.listen_warning = _t(
+                "Порт {} занят (другой торрент-клиент?) — слушаю {}."
+            ).format(DEFAULT_LISTEN_PORT, port)
+            print(f"[seed] WARN: {self.listen_warning}", flush=True)
         self.ses = lt.session({
-            "listen_interfaces": "0.0.0.0:6881",
+            "listen_interfaces": f"0.0.0.0:{port}",
             # libtorrent 2.0 по умолчанию мапит в память каждый файл крупнее
             # mmap_file_size_cutoff*16КиБ (по умолчанию 40 = 640 КиБ). При
             # сидировании это раздувает RSS на полный размер всех раздач (у нас
@@ -292,6 +335,10 @@ class SeedSession:
                     (RESUME_DIR / f"{hid}.dat").write_bytes(buf)
                 except (RuntimeError, OSError) as e:
                     print(f"[seed] write resume failed: {e}", flush=True)
+            elif isinstance(a, self.lt.udp_error_alert):
+                # Шум: пиры за NAT отвечают ICMP "port unreachable" на uTP-пакеты.
+                # На закачку не влияет, но забивает лог сотнями строк — пропускаем.
+                continue
             else:
                 msg = a.message()
                 low = msg.lower()

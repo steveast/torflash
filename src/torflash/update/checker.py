@@ -1,5 +1,7 @@
 """TorFlash: проверка наличия обновления на GitHub (QThread)."""
 
+import sys
+
 import requests
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -7,6 +9,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from torflash.config import APP_NAME, APP_VERSION, GITHUB_REPO, _proxies
 from torflash.i18n import _t
 from torflash.helpers import _version_tuple
+from torflash.update.assets import select_platform_asset
 
 
 class UpdateChecker(QThread):
@@ -32,14 +35,14 @@ class UpdateChecker(QThread):
                 return
             assets = data.get("assets", [])
             url_by_name = {a.get("name", ""): a.get("browser_download_url", "") for a in assets}
-            for asset in assets:
-                name = asset.get("name", "")
-                if name.startswith("TorFlash") and not name.endswith((".asc", ".sig", ".sha256", ".minisig")):
-                    sha_url = url_by_name.get(name + ".sha256", "")
-                    sig_url = url_by_name.get(name + ".minisig", "")
-                    self.found.emit(tag, asset["browser_download_url"], name, sha_url, sig_url)
-                    return
-            self.failed.emit(_t("Не найден бинарный asset в релизе"))
+            asset = select_platform_asset(assets, sys.platform)
+            if asset is None:
+                self.failed.emit(_t("Не найден бинарный asset в релизе"))
+                return
+            name = asset.get("name", "")
+            sha_url = url_by_name.get(name + ".sha256", "")
+            sig_url = url_by_name.get(name + ".minisig", "")
+            self.found.emit(tag, asset["browser_download_url"], name, sha_url, sig_url)
         except requests.RequestException as e:
             self.failed.emit(_t("Сеть: {}").format(e))
         except (ValueError, KeyError) as e:
