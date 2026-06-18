@@ -1,0 +1,34 @@
+# Конфигурация обновлений зависимостей Dependabot.
+# Документация: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Сканируем две экосистемы:
+#   - github-actions: закреплённые actions в .github/workflows/*.yml
+#   - pip: пины Python-зависимостей в requirements/*.txt
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # Один PR на все мелкие апдейты actions вместо пяти отдельных.
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "pip"
+    # Dependabot сам подхватывает все requirements/*.txt в этой папке
+    # (base / build / native / test) и проходит по -r включениям.
+    directory: "/requirements"
+    schedule:
+      interval: "weekly"
+    groups:
+      # Один PR на все апдейты Python-зависимостей.
+      python:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"

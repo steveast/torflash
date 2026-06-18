@@ -99,7 +99,7 @@ python3 src/rutor_search.py
 
 Для других дистрибутивов: `libtorrent-rasterbar` с Python-биндингами обычно идёт под именем `python3-libtorrent` (Debian/Ubuntu) или `python-libtorrent` (rpm).
 
-**Windows** — поставьте зависимости в virtualenv (`pip install PyQt5 libtorrent requests`) и запустите через PowerShell-хелпер:
+**Windows** — поставьте зависимости в virtualenv (`pip install -r requirements\native.txt -r requirements\base.txt`) и запустите через PowerShell-хелпер:
 
 ```powershell
 .\run.ps1
@@ -109,7 +109,7 @@ python3 src/rutor_search.py
 
 ```bash
 python3 -m venv --system-site-packages .build-venv
-.build-venv/bin/pip install pyinstaller
+.build-venv/bin/pip install -r requirements/build.txt
 .build-venv/bin/pyinstaller --clean --noconfirm TorFlash.spec
 # Готовый бинарник: dist/TorFlash
 ```

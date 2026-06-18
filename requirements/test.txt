@@ -1,0 +1,3 @@
+# Прогон тестов в CI (PyQt5/libtorrent тестам не нужны).
+-r base.txt
+pytest==9.0.3

@@ -51,7 +51,10 @@ UI (`ui/main_window.py`) не содержит ни одного `udisksctl`/`xd
 ## Сборка локально
 
 ```bash
-pip install pyinstaller requests cryptography PyQt5 libtorrent
+# Windows / macOS — самодостаточная pip-сборка:
+pip install -r requirements/build.txt -r requirements/native.txt
+# Linux — PyQt5/libtorrent из системных пакетов, ставим только сборочные:
+#   pip install -r requirements/build.txt
 pyinstaller --clean --noconfirm TorFlash.spec
 ```
 

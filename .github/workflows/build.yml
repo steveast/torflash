@@ -19,7 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install test dependencies
-        run: pip install pytest requests cryptography
+        run: pip install -r requirements/test.txt
 
       - name: Run tests
         run: python -m pytest tests/ -v
@@ -49,7 +49,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m venv --system-site-packages .build-venv
-          .build-venv/bin/pip install pyinstaller requests cryptography
+          .build-venv/bin/pip install -r requirements/build.txt
 
       - name: Build binary
         run: .build-venv/bin/pyinstaller --clean --noconfirm TorFlash.spec
@@ -116,7 +116,7 @@ jobs:
       - name: Install Python dependencies
         # libtorrent / PyQt5 ставятся pip-колёсами (на Linux — из apt). Внешние
         # mkvtoolnix/mediainfo не нужны: вызываются через shutil.which с фолбэком.
-        run: pip install pyinstaller requests cryptography PyQt5 "libtorrent==2.0.13"
+        run: pip install -r requirements/build.txt -r requirements/native.txt
 
       - name: Build binary
         run: pyinstaller --clean --noconfirm TorFlash.spec
@@ -169,7 +169,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install pyinstaller requests cryptography PyQt5 "libtorrent==2.0.13"
+        run: pip install -r requirements/build.txt -r requirements/native.txt
 
       - name: Build .app bundle
         run: pyinstaller --clean --noconfirm TorFlash.spec

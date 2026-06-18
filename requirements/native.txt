@@ -1,0 +1,5 @@
+# GUI и libtorrent для самодостаточной pip-сборки (Windows / macOS).
+# На Linux эти пакеты приходят из apt (python3-pyqt5 / python3-libtorrent)
+# через venv с --system-site-packages, поэтому в Linux-сборке файл НЕ нужен.
+PyQt5==5.15.11
+libtorrent==2.0.13
