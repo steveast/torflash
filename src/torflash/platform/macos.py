@@ -66,8 +66,14 @@ class MacOSBackend(PlatformBackend):
             except OSError:
                 continue
             info = self._diskutil_info(str(child))
-            # Берём только внешние/съёмные тома — не системный диск.
-            if info.get("RemovableMedia") or info.get("External") or info.get("Ejectable"):
+            # Только настоящий съёмный носитель (USB-флешка / SD-карта).
+            # Сознательно НЕ берём «просто External/Ejectable»: под это
+            # попадают внешние SSD, смонтированные .dmg и Time Machine-диски —
+            # форматирование стёрло бы их. Внутренний диск исключаем явно.
+            # (Строго; при прогоне на железе при необходимости ослабить.)
+            if info.get("Internal"):
+                continue
+            if info.get("RemovableMedia"):
                 return str(child)
         return None
 

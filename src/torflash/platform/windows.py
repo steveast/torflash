@@ -126,6 +126,7 @@ class WindowsBackend(PlatformBackend):
 
     def eject(self, mount: str, on_status: StatusCallback = None) -> OpResult:
         import ctypes
+        import time
         from ctypes import wintypes
 
         letter = mount[0]
@@ -166,12 +167,24 @@ class WindowsBackend(PlatformBackend):
         try:
             if on_status:
                 on_status("unmount")
-            # Lock может не пройти сразу, если том занят — пробуем несколько раз.
-            locked = any(ioctl(FSCTL_LOCK_VOLUME) for _ in range(20))
+            # Lock может не пройти сразу, если том занят — пробуем несколько
+            # раз с паузой, давая держателю дескрипторов время освободить том.
+            # (any() с range(20) без паузы бил все попытки мгновенно подряд,
+            # то есть фактически делал одну.)
+            locked = False
+            for _ in range(20):
+                if ioctl(FSCTL_LOCK_VOLUME):
+                    locked = True
+                    break
+                time.sleep(0.1)
             if not locked:
                 return OpResult(ok=False, step="unmount",
                                 message="volume is in use", device=mount)
-            ioctl(FSCTL_DISMOUNT_VOLUME)
+            # Если размонтировать не удалось при захваченной блокировке —
+            # не извлекаем (иначе рискуем выдернуть смонтированный том).
+            if not ioctl(FSCTL_DISMOUNT_VOLUME):
+                return OpResult(ok=False, step="unmount",
+                                message="dismount failed", device=mount)
             # PREVENT_MEDIA_REMOVAL: один байт BOOLEAN = 0 (разрешить извлечение).
             allow = ctypes.create_string_buffer(1)
             ioctl(IOCTL_STORAGE_MEDIA_REMOVAL, allow, 1)
@@ -238,14 +251,32 @@ class WindowsBackend(PlatformBackend):
 
         # Запущенный .exe заблокирован — заменить его на лету нельзя. Пишем
         # .bat-хелпер: он ждёт выхода нашего PID, делает move и перезапуск.
+        # Все ожидания ограничены по времени, а провал move фиксируется в
+        # <new>.log (а не глотается >nul), чтобы обновление не «терялось молча».
         pid = os.getpid()
         extra = " ".join(f'"{a}"' for a in argv)
+        log_path = f"{new_path}.log"
         bat = (
             "@echo off\r\n"
+            "setlocal enableextensions\r\n"
+            # ждём выхода нашего PID, но не дольше ~60 с (60 × ~1 с).
+            "set WAIT=0\r\n"
             ":wait\r\n"
-            f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul '
-            "&& (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
-            f'move /Y "{new_path}" "{current_exe}" >nul\r\n'
+            f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul || goto gone\r\n'
+            "set /a WAIT+=1\r\n"
+            f'if %WAIT% GEQ 60 (echo update aborted: pid {pid} still running > "{log_path}" '
+            '& del "%~f0" & exit /b)\r\n'
+            "ping -n 2 127.0.0.1 >nul & goto wait\r\n"
+            ":gone\r\n"
+            # move с ретраями: exe мог ещё не успеть отпустить файл.
+            "set MOVE=0\r\n"
+            ":domove\r\n"
+            f'move /Y "{new_path}" "{current_exe}" >nul 2>&1 && goto launch\r\n'
+            "set /a MOVE+=1\r\n"
+            f'if %MOVE% GEQ 10 (echo update failed: cannot replace "{current_exe}" > "{log_path}" '
+            f'& start "" "{current_exe}" {extra} & del "%~f0" & exit /b)\r\n'
+            "ping -n 2 127.0.0.1 >nul & goto domove\r\n"
+            ":launch\r\n"
             f'start "" "{current_exe}" {extra}\r\n'
             'del "%~f0"\r\n'
         )
