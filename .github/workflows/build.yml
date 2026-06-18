@@ -116,7 +116,7 @@ jobs:
       - name: Install Python dependencies
         # libtorrent / PyQt5 ставятся pip-колёсами (на Linux — из apt). Внешние
         # mkvtoolnix/mediainfo не нужны: вызываются через shutil.which с фолбэком.
-        run: pip install pyinstaller requests cryptography PyQt5 libtorrent
+        run: pip install pyinstaller requests cryptography PyQt5 "libtorrent==2.0.13"
 
       - name: Build binary
         run: pyinstaller --clean --noconfirm TorFlash.spec
@@ -169,7 +169,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install pyinstaller requests cryptography PyQt5 libtorrent
+        run: pip install pyinstaller requests cryptography PyQt5 "libtorrent==2.0.13"
 
       - name: Build .app bundle
         run: pyinstaller --clean --noconfirm TorFlash.spec

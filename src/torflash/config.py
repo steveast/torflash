@@ -35,7 +35,8 @@ ASSETS_DIR = _assets_dir()
 def _data_dir() -> Path:
     """Каталог пользовательских данных приложения, специфичный для ОС.
 
-    Linux:   $XDG_DATA_HOME/TorFlash (по умолчанию ~/.local/share/TorFlash).
+    Linux:   ~/.local/share/TorFlash (как исторически — НЕ через XDG_DATA_HOME,
+             чтобы у существующих пользователей библиотека не «переехала»).
     Windows: %LOCALAPPDATA%\\TorFlash.
     macOS:   ~/Library/Application Support/TorFlash."""
     if sys.platform == "win32":
@@ -43,8 +44,7 @@ def _data_dir() -> Path:
         return Path(base) / APP_NAME
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / APP_NAME
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / APP_NAME
+    return Path.home() / ".local" / "share" / APP_NAME
 
 
 LIBRARY_DIR = _data_dir()

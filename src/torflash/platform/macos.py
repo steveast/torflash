@@ -14,6 +14,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .base import OpResult, PlatformBackend, StatusCallback
@@ -26,20 +27,33 @@ LAUNCH_LABEL = "pro.torflash.autostart"
 class MacOSBackend(PlatformBackend):
     name = "macos"
 
+    # Короткий TTL-кэш diskutil: схлопывает повторные вызовы для одного тома
+    # внутри одного тика обновления (find → fstype → device дёргают diskutil для
+    # одного mount). Новый том на первом тике — всегда промах кэша, так что
+    # задержки в обнаружении вставленной флешки нет.
+    _INFO_TTL = 3.0
+
+    def __init__(self):
+        self._info_cache: "dict[str, tuple[float, dict]]" = {}
+
     # --- сменный носитель: чтение ---
 
     def _diskutil_info(self, target: str) -> dict:
-        """diskutil info -plist <target> → dict (пусто при ошибке)."""
+        """diskutil info -plist <target> → dict (пусто при ошибке), с TTL-кэшем."""
+        now = time.monotonic()
+        hit = self._info_cache.get(target)
+        if hit is not None and now - hit[0] < self._INFO_TTL:
+            return hit[1]
         try:
             out = subprocess.run(
                 ["diskutil", "info", "-plist", target],
                 capture_output=True, timeout=10,
             )
-            if out.returncode != 0:
-                return {}
-            return plistlib.loads(out.stdout)
+            info = plistlib.loads(out.stdout) if out.returncode == 0 else {}
         except (subprocess.SubprocessError, OSError, plistlib.InvalidFileException):
-            return {}
+            info = {}
+        self._info_cache[target] = (now, info)
+        return info
 
     def find_flash_mount(self) -> "str | None":
         volumes = Path("/Volumes")
@@ -159,8 +173,8 @@ class MacOSBackend(PlatformBackend):
 
     def install_update(self, new_path: str, current_exe: str,
                        argv: "list[str]") -> None:
-        # Работает для «голого» исполняемого файла. Для .app-бандла in-place
-        # замена не годится — там обновление ставится из .dmg вручную.
-        os.replace(new_path, current_exe)
-        os.chmod(current_exe, 0o755)
-        os.execv(current_exe, [current_exe] + list(argv))
+        # Релизный macOS-ассет — это .app.zip, а не «голый» бинарь, поэтому
+        # in-place замена исполняемого файла невозможна (заменили бы mach-o на
+        # zip и сломали .app). Честно отказываемся — обновление .app ставится
+        # вручную. Подробности — docs/cross-platform.md.
+        raise OSError("на macOS обновите TorFlash.app вручную из GitHub Releases")
