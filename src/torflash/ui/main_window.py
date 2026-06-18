@@ -69,6 +69,18 @@ from torflash.dl_slot import _DlSlot
 from torflash.runtime import themed_icon
 
 
+def _open_in_file_manager(path) -> None:
+    """Открыть файл/папку в системном файловом менеджере, кроссплатформенно.
+    Бросает OSError при неудаче — вызывающий показывает сообщение."""
+    p = str(path)
+    if sys.platform == "win32":
+        os.startfile(p)  # Проводник, дефолтный обработчик
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", p])
+    else:
+        subprocess.Popen(["xdg-open", p])
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -674,13 +686,17 @@ class MainWindow(QMainWindow):
                 self.flash_files_table.setItem(i, col, it)
         self._update_flash_buttons_state()
 
+    def _open_path(self, path) -> None:
+        """Открыть путь в файловом менеджере, с сообщением об ошибке."""
+        try:
+            _open_in_file_manager(path)
+        except OSError as e:
+            self.statusBar().showMessage(_t("Не открыть {}: {}").format(path, e), 4000)
+
     def _open_flash_folder(self):
         mount = detect_flash_mount()
         if mount:
-            try:
-                subprocess.Popen(["xdg-open", mount])
-            except OSError as e:
-                self.statusBar().showMessage(_t("Ошибка: {}").format(e), 3000)
+            self._open_path(mount)
 
     def _flash_file_menu(self, pos):
         item = self.flash_files_table.itemAt(pos)
@@ -697,7 +713,7 @@ class MainWindow(QMainWindow):
         # Открыть — для первой части (для одиночных это и есть сам файл)
         act_open = menu.addAction(_t("Открыть"))
         first = paths[0]
-        act_open.triggered.connect(lambda: subprocess.Popen(["xdg-open", first]))
+        act_open.triggered.connect(lambda: self._open_path(first))
         menu.addSeparator()
         label = _t("Удалить с флешки") if len(paths) == 1 else _t("Удалить с флешки ({} частей)").format(len(paths))
         act_del = menu.addAction(label)
@@ -2414,10 +2430,7 @@ class MainWindow(QMainWindow):
         if not meta:
             return
         save = Path(meta.get("save_path", STORAGE_DEFAULT))
-        try:
-            subprocess.Popen(["xdg-open", str(save)])
-        except OSError as e:
-            self._show_banner(_t("Не открыть {}: {}").format(save, e))
+        self._open_path(save)
 
     def _lib_remove(self, info_hash: str, delete_files: bool):
         self.seed.remove(info_hash, delete_files=delete_files)
