@@ -4,6 +4,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/steveast/torflash/build.yml)](https://github.com/steveast/torflash/actions)
 [![License: MIT](https://img.shields.io/github/license/steveast/torflash)](LICENSE)
 [![Downloads](https://img.shields.io/github/downloads/steveast/torflash/total)](https://github.com/steveast/torflash/releases)
+[![AUR](https://img.shields.io/aur/version/torflash-bin)](https://aur.archlinux.org/packages/torflash-bin)
 
 English · **[Русский](README.ru.md)**
 
