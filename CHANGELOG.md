@@ -2,6 +2,27 @@
 
 All notable changes to TorFlash are documented here.
 
+## [Unreleased]
+Cross-platform support — Windows and macOS.
+- New OS abstraction layer (`torflash/platform/`): flash-drive detection,
+  FAT32 format, safe eject, "open in file manager", autostart and self-update
+  install are now routed through a `PlatformBackend` with `linux`/`windows`/
+  `macos` implementations. Linux behaviour is unchanged (still udisks2/udisksctl
+  + XDG autostart).
+- Windows backend: removable-drive enumeration and eject via Win32 (`ctypes`,
+  no extra deps), FAT32 format via PowerShell `Format-Volume`, autostart via the
+  `HKCU\…\Run` registry key, and a deferred `.bat` helper for self-update
+  (a running `.exe` can't replace itself in place).
+- macOS backend (experimental): `diskutil` for detection/format/eject, a
+  LaunchAgent for autostart. Unsigned builds are blocked by Gatekeeper — see
+  `docs/cross-platform.md` for signing/notarization.
+- Per-OS data dir: `%LOCALAPPDATA%\TorFlash` (Windows),
+  `~/Library/Application Support/TorFlash` (macOS), `$XDG_DATA_HOME` (Linux).
+- Auto-updater selects the right release asset per platform; notifications fall
+  back to the system tray where `notify-send` is absent.
+- CI builds Windows (`.exe`) and macOS (`.app.zip`) alongside Linux; PyInstaller
+  spec gained per-OS icon and a macOS `.app` bundle.
+
 ## [1.9.2] — 2026-06-14
 Security: signed releases.
 - Releases are now signed with minisign (Ed25519). The auto-updater verifies

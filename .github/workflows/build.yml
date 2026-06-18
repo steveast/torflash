@@ -101,8 +101,111 @@ jobs:
             dist/TorFlash-x86_64.AppImage.sha256
             dist/TorFlash-x86_64.AppImage.minisig
 
+  build-windows:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        # libtorrent / PyQt5 ставятся pip-колёсами (на Linux — из apt). Внешние
+        # mkvtoolnix/mediainfo не нужны: вызываются через shutil.which с фолбэком.
+        run: pip install pyinstaller requests cryptography PyQt5 libtorrent
+
+      - name: Build binary
+        run: pyinstaller --clean --noconfirm TorFlash.spec
+
+      - name: Verify binary exists
+        run: |
+          if (-not (Test-Path dist\TorFlash.exe)) { throw "TorFlash.exe не собран" }
+          "Build OK — {0:N1} MB" -f ((Get-Item dist\TorFlash.exe).Length / 1MB)
+
+      - name: Generate checksum
+        run: |
+          $h = (Get-FileHash dist\TorFlash.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  TorFlash.exe" | Out-File -FilePath dist\TorFlash.exe.sha256 -Encoding ascii
+          Get-Content dist\TorFlash.exe.sha256
+
+      # Подпись minisign активна только при заданном secret MINISIGN_KEY.
+      - name: Sign artifact (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          if (-not $env:MINISIGN_KEY) { Write-Host "MINISIGN_KEY не задан — подпись пропущена"; exit 0 }
+          $env:MINISIGN_KEY | Out-File -FilePath "$env:TEMP\ms.key" -Encoding ascii
+          python scripts\minisign_sign.py "$env:TEMP\ms.key" dist\TorFlash.exe
+          Remove-Item "$env:TEMP\ms.key"
+          Get-ChildItem dist\*.minisig
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: TorFlash-windows-x86_64
+          if-no-files-found: ignore
+          path: |
+            dist/TorFlash.exe
+            dist/TorFlash.exe.sha256
+            dist/TorFlash.exe.minisig
+
+  build-macos:
+    needs: test
+    # macOS экспериментально: без подписи/нотаризации Apple Gatekeeper блокирует
+    # запуск. Только на тегах; не блокирует релиз (continue-on-error).
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install pyinstaller requests cryptography PyQt5 libtorrent
+
+      - name: Build .app bundle
+        run: pyinstaller --clean --noconfirm TorFlash.spec
+
+      - name: Package .app
+        run: |
+          test -d dist/TorFlash.app || { echo "TorFlash.app не собран"; exit 1; }
+          ditto -c -k --keepParent dist/TorFlash.app dist/TorFlash-macos.app.zip
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          shasum -a 256 TorFlash-macos.app.zip > TorFlash-macos.app.zip.sha256
+          cat TorFlash-macos.app.zip.sha256
+
+      - name: Sign artifact (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: |
+          if [ -z "$MINISIGN_KEY" ]; then echo "MINISIGN_KEY не задан — подпись пропущена"; exit 0; fi
+          printf '%s\n' "$MINISIGN_KEY" > /tmp/ms.key
+          python scripts/minisign_sign.py /tmp/ms.key dist/TorFlash-macos.app.zip
+          rm -f /tmp/ms.key
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TorFlash-macos
+          if-no-files-found: ignore
+          path: |
+            dist/TorFlash-macos.app.zip
+            dist/TorFlash-macos.app.zip.sha256
+            dist/TorFlash-macos.app.zip.minisig
+
   release:
-    needs: [test, build]
+    needs: [test, build, build-windows, build-macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -110,26 +213,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download binary
+      - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
-          name: TorFlash-linux-x86_64
+          path: dist-all
 
-      - name: Download AppImage
-        uses: actions/download-artifact@v4
-        with:
-          name: TorFlash-AppImage
+      - name: List artifacts
+        run: find dist-all -type f | sort
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            TorFlash
-            TorFlash.sha256
-            TorFlash-x86_64.AppImage
-            TorFlash-x86_64.AppImage.sha256
-            TorFlash.minisig
-            TorFlash-x86_64.AppImage.minisig
-          fail_on_unmatched_files: false   # .minisig присутствуют только при настроенной подписи
+            dist-all/**/TorFlash
+            dist-all/**/TorFlash.exe
+            dist-all/**/*.AppImage
+            dist-all/**/*.app.zip
+            dist-all/**/*.sha256
+            dist-all/**/*.minisig
+          fail_on_unmatched_files: false   # .minisig есть только при настроенной подписи; macOS может отсутствовать
           generate_release_notes: true
           draft: false

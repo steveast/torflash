@@ -13,7 +13,9 @@ English · **[Русский](README.ru.md)**
   <img src="assets/screenshot.png" alt="TorFlash screenshot" width="800">
 </p>
 
-A Linux desktop app in PyQt5. Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open KTorrent, wait, copy manually" dance.
+A cross-platform desktop app in PyQt5 (Linux, Windows, macOS). Downloads via `libtorrent-rasterbar`, scrapes rutor.info over HTTP, stores movies on your flash drive — no more "plug in the stick, open a torrent client, wait, copy manually" dance.
+
+> Linux is the primary, fully-tested target. Windows is supported (CI builds a signed `.exe`); macOS is experimental and needs signing/notarization to pass Gatekeeper. See [docs/cross-platform.md](docs/cross-platform.md).
 
 ## Features
 

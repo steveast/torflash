@@ -202,6 +202,7 @@ _EN: dict[str, str] = {
     "Перепроверка пиров запущена": "Peer recheck started",
     "recheck недоступен: {}": "recheck unavailable: {}",
     "Не открыть {}: {}": "Cannot open {}: {}",
+    "Не удалось открыть {}": "Failed to open {}",
     "Удалено вместе с файлами": "Removed with files",
     "Убрано из раздачи": "Removed from seeding",
     "Запланировано — скопируем при появлении флешки": "Scheduled \u2014 will copy when flash drive appears",

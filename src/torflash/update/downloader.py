@@ -11,6 +11,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from torflash.config import MINISIGN_PUBKEY, _proxies
 from torflash.i18n import _t
 from torflash.helpers import human_bytes, _sha256_from_sumfile
+from torflash.platform import backend
 from torflash.update.signature import verify_minisign
 
 
@@ -44,7 +45,7 @@ class UpdateDownloader(QThread):
                 self.failed.emit(_t("Не удалось прочитать контрольную сумму релиза"))
                 return
 
-            target = Path(self.target_dir) / "TorFlash.new"
+            target = Path(self.target_dir) / backend.update_artifact_name()
             r = requests.get(self.url, stream=True, timeout=60, proxies=_proxies())
             r.raise_for_status()
             total = int(r.headers.get("content-length") or 0)

@@ -1,5 +1,6 @@
 """TorFlash: константы, пути и глобальное состояние прокси (без Qt)."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,7 +32,22 @@ def _assets_dir() -> Path:
 ASSETS_DIR = _assets_dir()
 
 
-LIBRARY_DIR = Path.home() / ".local" / "share" / "TorFlash"
+def _data_dir() -> Path:
+    """Каталог пользовательских данных приложения, специфичный для ОС.
+
+    Linux:   $XDG_DATA_HOME/TorFlash (по умолчанию ~/.local/share/TorFlash).
+    Windows: %LOCALAPPDATA%\\TorFlash.
+    macOS:   ~/Library/Application Support/TorFlash."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / APP_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / APP_NAME
+
+
+LIBRARY_DIR = _data_dir()
 
 
 TORRENTS_CACHE_DIR = LIBRARY_DIR / "torrents"
@@ -44,9 +60,6 @@ LIBRARY_FILE = LIBRARY_DIR / "library.json"
 
 
 STORAGE_DEFAULT = Path.home() / "Storage"
-
-
-AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "TorFlash.desktop"
 
 
 EXTRA_TRACKERS = [
