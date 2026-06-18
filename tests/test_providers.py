@@ -15,7 +15,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 class TestRutorParser:
     def _parse(self):
         from torflash.providers.rutor import _parse
-        html = (FIXTURES / "rutor_search.html").read_text()
+        html = (FIXTURES / "rutor_search.html").read_text(encoding="utf-8")
         return _parse(html, "https://rutor.info")
 
     def test_finds_results(self):
@@ -64,7 +64,7 @@ class TestRutorParser:
 class TestNnmParser:
     def _parse(self):
         from torflash.providers.nnm import _parse
-        html = (FIXTURES / "nnm_search.html").read_text()
+        html = (FIXTURES / "nnm_search.html").read_text(encoding="utf-8")
         return _parse(html)
 
     def test_finds_results(self):
@@ -107,7 +107,7 @@ class TestRutorMeta:
             _extract_poster, _extract_description, _extract_screenshots,
             _extract_year, _extract_magnet_and_hash, _extract_title,
         )
-        html = (FIXTURES / "rutor_detail.html").read_text()
+        html = (FIXTURES / "rutor_detail.html").read_text(encoding="utf-8")
         details_m = re.search(r'(?is)<table\s+id="details".*?</table>', html)
         details = details_m.group(0) if details_m else html
         host = "rutor.info"
