@@ -2,7 +2,7 @@
 
 All notable changes to TorFlash are documented here.
 
-## [Unreleased]
+## [1.10.0] — 2026-06-18
 Cross-platform support — Windows and macOS.
 - New OS abstraction layer (`torflash/platform/`): flash-drive detection,
   FAT32 format, safe eject, "open in file manager", autostart and self-update
