@@ -139,6 +139,8 @@ class MainWindow(QMainWindow):
         # Применяем сохранённые настройки скорости и темы
         self._apply_settings()
         self._refresh_library()
+        if self.seed.listen_warning:
+            self.statusBar().showMessage(self.seed.listen_warning, 10000)
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search)
         QShortcut(QKeySequence("Escape"), self, self._on_escape)

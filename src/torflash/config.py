@@ -74,6 +74,15 @@ EXTRA_TRACKERS = [
 SEARCH_HISTORY_MAX = 30
 
 
+# libtorrent слушает TCP+UDP на этом порту. Если занят (например, параллельно
+# запущен другой торрент-клиент), пробуем следующие до DEFAULT_LISTEN_PORT+SPAN,
+# затем отдаём выбор порта ОС (0). Жёсткий один порт = «listening on 0» и тишина.
+DEFAULT_LISTEN_PORT = 6881
+
+
+LISTEN_PORT_SPAN = 20
+
+
 _proxy: str = ""
 
 
