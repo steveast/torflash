@@ -22,6 +22,14 @@ Cross-platform support — Windows and macOS.
   back to the system tray where `notify-send` is absent.
 - CI builds Windows (`.exe`) and macOS (`.app.zip`) alongside Linux; PyInstaller
   spec gained per-OS icon and a macOS `.app` bundle.
+- Windows run-from-source/build fixes: import `libtorrent` before PyQt5 to avoid
+  an OpenSSL DLL clash (`0xC0000005`), strip the bundled MSVC runtime from the
+  PyInstaller build so it uses the system one, read HTML test fixtures as UTF-8,
+  and a `run.ps1` launcher.
+- Listen-port fallback: if 6881 is taken (e.g. another torrent client), bind the
+  first free port in 6881–6900, else let the OS pick an ephemeral one, with a
+  status-bar warning instead of a silent "listening on 0". Noisy
+  `udp_error_alert` log spam from NATed uTP peers is suppressed.
 
 ## [1.9.2] — 2026-06-14
 Security: signed releases.
