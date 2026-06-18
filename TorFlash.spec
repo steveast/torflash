@@ -44,6 +44,22 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Windows: PyQt5's wheel ships an older MSVC C++ runtime than libtorrent 2.0.x
+# was built against. With both in one _MEIPASS dir PyInstaller keeps the older
+# copy, and creating an lt.session() then crashes with an access violation
+# (0xC0000005). Drop the bundled runtime so the exe uses the system one
+# (installed by the VC++ 2015-2022 redistributable, which Python also requires).
+import sys as _sys, os as _os
+if _sys.platform == "win32":
+    _msvc_rt = {
+        "vcruntime140.dll", "vcruntime140_1.dll",
+        "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+        "concrt140.dll",
+    }
+    a.binaries = [b for b in a.binaries
+                  if _os.path.basename(b[0]).lower() not in _msvc_rt]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -65,4 +81,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=('assets/torflash.ico' if _sys.platform == 'win32' else None),
 )
