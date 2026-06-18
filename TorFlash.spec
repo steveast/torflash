@@ -54,6 +54,21 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# Windows: колесо PyQt5 несёт более старый MSVC C++ runtime, чем тот, под
+# который собран libtorrent 2.0.x. Если обе копии оказываются в одном _MEIPASS,
+# PyInstaller оставляет старую, и создание lt.session() падает с access
+# violation (0xC0000005). Выкидываем бандлёный runtime — exe возьмёт системный
+# (его ставит распространяемый пакет VC++ 2015-2022, нужный и самому Python).
+if sys.platform == 'win32':
+    _msvc_rt = {
+        'vcruntime140.dll', 'vcruntime140_1.dll',
+        'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+        'concrt140.dll',
+    }
+    a.binaries = [b for b in a.binaries
+                  if os.path.basename(b[0]).lower() not in _msvc_rt]
+
 pyz = PYZ(a.pure)
 
 
