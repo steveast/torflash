@@ -1375,7 +1375,7 @@ class MainWindow(QMainWindow):
         # Обновляем кнопку/прогресс при смене выделенного результата
         self._sync_detail_buttons(r)
         if r["page"]:
-            self._meta_fetcher = MetaFetcher(r["page"])
+            self._meta_fetcher = MetaFetcher(r["page"], r.get("provider", ""))
             self._meta_fetcher.fetched.connect(self._on_meta_fetched)
             self._track_thread(self._meta_fetcher)
 
@@ -1469,8 +1469,9 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         lbl = QLabel()
         lbl.setAlignment(Qt.AlignCenter)
-        # Загрузим полноразмерную версию (fastpic: заменяем /thumb/ на /big/)
-        full_url = url.replace("/thumb/", "/big/")
+        # Загрузим полноразмерную версию из миниатюры. У разных хостингов своя
+        # схема: fastpic /thumb/→/big/, imageban /thumbs/→/out/ (imgbox _o — уже full).
+        full_url = url.replace("/thumbs/", "/out/").replace("/thumb/", "/big/")
         try:
             import requests
             r = requests.get(full_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, proxies=_proxies())
@@ -1835,7 +1836,7 @@ class MainWindow(QMainWindow):
             self._show_banner(_t("У этого источника нет magnet — используйте «Скачать»"))
             return
         self.statusBar().showMessage(_t("Получаю magnet…"), 5000)
-        fetcher = MetaFetcher(page)
+        fetcher = MetaFetcher(page, r.get("provider", ""))
 
         def _on_magnet(url, data, _r=r):
             m = (data.get("magnet") or "").strip()

@@ -161,6 +161,60 @@ class TestRutorMeta:
         assert data["year"].isdigit() and len(data["year"]) == 4
 
 
+class TestNnmMeta:
+    """NNM-Club (phpBB) — постер/скриншоты лениво грузятся через <var>-теги,
+    а сырые <img> — это chrome форума (RSS, баннер «1 апреля», смайлы, аватары)."""
+
+    def _page(self):
+        return (FIXTURES / "nnm_detail.html").read_text(encoding="utf-8")
+
+    def test_poster_is_real_content(self):
+        from torflash.meta_phpbb import _extract_images
+        poster, _ = _extract_images(self._page())
+        assert poster.startswith("http"), "Постер не найден"
+        assert "nnmstatic.win/forum/images/" not in poster, "Постер — chrome форума"
+        assert not poster.endswith(".gif"), f"Постер — gif-мусор: {poster}"
+
+    def test_screenshots_found(self):
+        from torflash.meta_phpbb import _extract_images
+        _, shots = _extract_images(self._page())
+        assert len(shots) > 0, "Скриншоты не найдены"
+
+    def test_no_chrome_junk_in_images(self):
+        from torflash.meta_phpbb import _extract_images
+        poster, shots = _extract_images(self._page())
+        for u in [poster, *shots]:
+            low = u.lower()
+            assert "rss.png" not in low, f"RSS-иконка попала в картинки: {u}"
+            assert "1april" not in low, f"Сезонный баннер попал в картинки: {u}"
+            assert "/images/smiles/" not in low, f"Смайл попал в картинки: {u}"
+            assert "kinopoisk.ru/rating" not in low, f"Рейтинг-бейдж попал: {u}"
+            assert not low.endswith(".gif"), f"GIF-мусор в картинках: {u}"
+
+    def test_poster_not_in_screenshots(self):
+        from torflash.meta_phpbb import _extract_images
+        poster, shots = _extract_images(self._page())
+        assert poster not in shots, "Постер не должен дублироваться в скриншотах"
+
+    def test_proxy_links_unwrapped(self):
+        from torflash.meta_phpbb import _extract_images
+        poster, shots = _extract_images(self._page())
+        for u in [poster, *shots]:
+            assert "image.php?link=" not in u, f"Прокси не развёрнут: {u}"
+
+    def test_description_excludes_author_column(self):
+        from torflash.meta_phpbb import _extract_description
+        desc = _extract_description(self._page())
+        assert len(desc) > 50, "Описание слишком короткое"
+        assert "Стаж" not in desc, "Колонка автора попала в описание"
+
+    def test_magnet_present(self):
+        from torflash.meta import _extract_magnet_and_hash
+        magnet, info_hash = _extract_magnet_and_hash(self._page())
+        assert magnet.startswith("magnet:?"), f"Некорректный magnet: {magnet[:50]}"
+        assert len(info_hash) == 40, f"Hash не 40 символов: {info_hash}"
+
+
 class TestSizeParser:
     def test_parse_gb(self):
         from torflash.helpers import parse_size_text

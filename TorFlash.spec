@@ -18,7 +18,7 @@ binaries = []
 hiddenimports = [
     'requests',
     'torflash', 'torflash.config', 'torflash.i18n', 'torflash.helpers',
-    'torflash.runtime', 'torflash.dl_slot', 'torflash.meta', 'torflash.mediainfo', 'torflash.themes',
+    'torflash.runtime', 'torflash.dl_slot', 'torflash.meta', 'torflash.meta_phpbb', 'torflash.mediainfo', 'torflash.themes',
     'torflash.session', 'torflash.session.seed_session', 'torflash.session.download_worker',
     'torflash.workers', 'torflash.workers.copy_worker', 'torflash.workers.search_worker',
     'torflash.workers.meta_fetcher', 'torflash.workers.poster_fetcher',
