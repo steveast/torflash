@@ -2,6 +2,17 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.10.1] — 2026-06-24
+Bugfix: detail-page images for forum trackers.
+- NoNaMe-Club / RuTracker detail pages were parsed with the rutor-specific
+  scraper, which scooped up forum chrome — the RSS button as the "poster", the
+  seasonal "1 апреля" banner and smilies as "screenshots" — and the post
+  author column ("Стаж …") into the description. These phpBB forums lazy-load
+  the real poster and screenshots via `<var class="postImg">` tags, so meta
+  fetching now dispatches to a dedicated phpBB parser (`torflash.meta_phpbb`)
+  per provider; the rutor path is unchanged. The full-size screenshot view also
+  resolves imageban thumbnails to their originals.
+
 ## [1.10.0] — 2026-06-18
 Cross-platform support — Windows and macOS.
 - New OS abstraction layer (`torflash/platform/`): flash-drive detection,
