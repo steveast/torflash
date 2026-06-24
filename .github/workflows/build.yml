@@ -290,8 +290,11 @@ jobs:
           install -dm700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
+          # accept-new — надёжная замена ssh-keyscan: в контейнере keyscan порой
+          # не наполняет known_hosts (или отдаёт ключ другого типа), и clone падал
+          # с «Host key verification failed». accept-new сам добавит ключ хоста.
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           git clone ssh://aur@aur.archlinux.org/torflash-bin.git aur-clone
           cp aur/PKGBUILD aur/.SRCINFO aur-clone/
           cd aur-clone
