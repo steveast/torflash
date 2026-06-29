@@ -1,6 +1,7 @@
 """TorFlash: главное окно приложения (вкладки поиск/библиотека/флешка/настройки)."""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,6 +62,7 @@ from torflash.workers.copy_worker import CopyWorker
 from torflash.workers.search_worker import SearchWorker
 from torflash.workers.meta_fetcher import MetaFetcher
 from torflash.workers.poster_fetcher import PosterFetcher
+from torflash.workers.torrent_file_fetcher import TorrentFileFetcher
 from torflash.update.checker import UpdateChecker
 from torflash.update.downloader import UpdateDownloader
 from torflash.widgets.speed_graph import SpeedGraph
@@ -1081,6 +1083,11 @@ class MainWindow(QMainWindow):
         self.ktorrent_btn.setIcon(themed_icon("ktorrent", style, QStyle.SP_MediaPlay))
         self.ktorrent_btn.clicked.connect(self.open_in_ktorrent)
         actions.addWidget(self.ktorrent_btn)
+        self.torrent_btn = QPushButton(_t("Скачать .torrent"))
+        self.torrent_btn.setIcon(themed_icon("document-save", style, QStyle.SP_DialogSaveButton))
+        self.torrent_btn.setToolTip(_t("Сохранить .torrent-файл на диск"))
+        self.torrent_btn.clicked.connect(self.save_torrent_file)
+        actions.addWidget(self.torrent_btn)
         self.page_btn = QPushButton(_t("Страница"))
         self.page_btn.setIcon(themed_icon("internet-web-browser", style, QStyle.SP_DirLinkIcon))
         self.page_btn.clicked.connect(self.open_page)
@@ -1869,6 +1876,46 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(_t("Открыто в KTorrent"), 3000)
         except OSError as e:
             self._show_banner(_t("Ошибка запуска KTorrent: {}").format(e))
+
+    def save_torrent_file(self):
+        r = self.current_result()
+        if not r:
+            return
+        torrent_url = (r.get("torrent_url") or "").strip()
+        if not torrent_url:
+            self._show_banner(_t("У этого источника нет .torrent — используйте magnet"))
+            return
+        # Имя по заголовку, очищенное от запрещённых в имени файла символов.
+        raw_name = (r.get("title") or "torrent").strip()
+        safe_name = re.sub(r'[/\\:*?"<>|]+', "_", raw_name)[:120].strip() or "torrent"
+        start_dir = self.settings.value("torrent_save_dir", str(Path.home()), type=str)
+        dest, _flt = QFileDialog.getSaveFileName(
+            self, _t("Сохранить .torrent"),
+            str(Path(start_dir) / f"{safe_name}.torrent"),
+            _t("Torrent-файлы (*.torrent)"),
+        )
+        if not dest:
+            return
+        if not dest.lower().endswith(".torrent"):
+            dest += ".torrent"
+        self.settings.setValue("torrent_save_dir", str(Path(dest).parent))
+        # Для авторизованных провайдеров (RuTracker) передаём cookies сессии.
+        cookies = None
+        prov = get_provider(r.get("provider", ""))
+        if prov and hasattr(prov, "_session") and prov._session:
+            cookies = prov._session.cookies
+        self._hide_banner()
+        self.statusBar().showMessage(_t("Скачиваю .torrent…"), 5000)
+        fetcher = TorrentFileFetcher(torrent_url, dest, cookies=cookies)
+        fetcher.done.connect(self._on_torrent_saved)
+        fetcher.failed.connect(self._on_torrent_save_failed)
+        self._track_thread(fetcher)
+
+    def _on_torrent_saved(self, path: str):
+        self.statusBar().showMessage(_t(".torrent сохранён: {}").format(path), 6000)
+
+    def _on_torrent_save_failed(self, err: str):
+        self._show_banner(_t("Не удалось скачать .torrent: {}").format(err))
 
     def download_to_flash(self):
         r = self.current_result()

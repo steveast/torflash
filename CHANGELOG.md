@@ -2,6 +2,15 @@
 
 All notable changes to TorFlash are documented here.
 
+## [1.11.0] — 2026-06-29
+Save the .torrent file to disk from the detail page.
+- The detail panel gained a **Save .torrent** button alongside Magnet /
+  KTorrent / Page / Download. It fetches the `.torrent` from the source's
+  `torrent_url` — through the configured proxy, and with session cookies for
+  authorized trackers (RuTracker) — on a background thread and writes it to a
+  location you choose. The last-used directory is remembered, and a sanity
+  check rejects HTML login pages returned in place of a real bencoded torrent.
+
 ## [1.10.1] — 2026-06-24
 Bugfix: detail-page images for forum trackers.
 - NoNaMe-Club / RuTracker detail pages were parsed with the rutor-specific

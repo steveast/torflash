@@ -25,7 +25,7 @@ A cross-platform desktop app in PyQt5 (Linux, Windows, macOS). Downloads via `li
 - 📂 **Category filter** — movies / series / cartoons / games / music / books / software / sport / etc.
 - 🕘 **Query history** with autocomplete
 - 🖼 **Poster + screenshots** in the detail panel (parsed from the torrent page, click to enlarge)
-- 🧲 **Magnet + .torrent** — fetches `.torrent` straight from the source for instant metadata
+- 🧲 **Magnet + .torrent** — copy the magnet link or save the `.torrent` file to disk; metadata is fetched straight from the source
 - 🔢 **Numeric sorting** — sort results by seeds, leeches or size correctly
 - 🌐 **i18n** — Russian / English, language switcher in settings
 
